@@ -5,13 +5,17 @@ namespace IPCamClockSync.Tests;
 public sealed class WsDiscoveryTests
 {
     [Fact]
-    public void BuildProbeMessage_ShouldContainNetworkVideoTransmitterType()
+    public void BuildProbeSequence_ShouldContainNetworkVideoTransmitterType()
     {
-        var xml = WsDiscoveryMessageBuilder.BuildProbeMessage(Guid.Parse("11111111-1111-1111-1111-111111111111"));
+        var multicast = new System.Net.IPEndPoint(System.Net.IPAddress.Parse("239.255.255.250"), 3702);
+        var broadcast = new System.Net.IPEndPoint(System.Net.IPAddress.Parse("255.255.255.255"), 3702);
 
-        Assert.Contains("NetworkVideoTransmitter", xml, StringComparison.Ordinal);
-        Assert.Contains("urn:uuid:11111111-1111-1111-1111-111111111111", xml, StringComparison.Ordinal);
-      Assert.Contains("http://www.w3.org/2005/08/addressing", xml, StringComparison.Ordinal);
+        var sequence = WsDiscoveryMessageBuilder.BuildProbeSequence(multicast, broadcast).ToList();
+        var firstPayload = System.Text.Encoding.UTF8.GetString(sequence[0].Payload);
+
+        Assert.Equal(8, sequence.Count);
+        Assert.Contains("NetworkVideoTransmitter", firstPayload, StringComparison.Ordinal);
+        Assert.Contains("http://www.w3.org/2005/08/addressing", firstPayload, StringComparison.Ordinal);
     }
 
     [Fact]

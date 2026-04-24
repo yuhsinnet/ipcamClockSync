@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Sockets;
 using IPCamClockSync.Core.Configuration;
 using IPCamClockSync.Core.Data;
 using IPCamClockSync.Core.Discovery;
@@ -53,8 +55,8 @@ public sealed class CliCommandDispatcher
         return command.Name switch
         {
             "scan" => ExecuteScan(),
-            "update-once" => new CommandExecutionResult { ExitCode = 0, Message = "Update placeholder: single-time sync pipeline reserved." },
-            "set-ntp" => new CommandExecutionResult { ExitCode = 0, Message = "Set-NTP placeholder: ONVIF NTP push reserved." },
+            "update-once" => ExecuteUpdateOnce(),
+            "set-ntp" => ExecuteSetNtp(command),
             "validate" => ExecuteValidate(),
             "export" => ExecuteExport(),
             _ => new CommandExecutionResult { ExitCode = 2, Message = "Unknown operate command." },
@@ -164,6 +166,180 @@ public sealed class CliCommandDispatcher
         }
     }
 
+    private CommandExecutionResult ExecuteUpdateOnce()
+    {
+        try
+        {
+            var settings = _settingsStore.Load(_paths.SettingsFilePath);
+            var cameraDocument = _cameraListStore.Load(
+                _paths.CamerasFilePath,
+                new CameraListStoreOptions
+                {
+                    EnableCredentialEncryption = settings.Security.ObfuscatePasswordsWithBase64,
+                });
+
+            var targets = cameraDocument.Cameras.Where(camera => camera.Enabled).ToList();
+            if (targets.Count == 0)
+            {
+                return new CommandExecutionResult { ExitCode = 0, Message = "No enabled camera found. Nothing to update." };
+            }
+
+            var outcomes = targets.Select(camera => RunUpdatePrecheck(camera, settings)).ToList();
+            var successCount = outcomes.Count(result => result.IsSuccess);
+            var failCount = outcomes.Count - successCount;
+
+            var lines = new List<string>
+            {
+                $"Update precheck completed. Success={successCount}, Failed={failCount}, Total={outcomes.Count}",
+            };
+
+            lines.AddRange(outcomes.Select(item =>
+                item.IsSuccess
+                    ? $"[OK] {item.CameraId} {item.Ip}:{item.Port} attempts={item.Attempts} message={item.Message}"
+                    : $"[FAIL] {item.CameraId} {item.Ip}:{item.Port} attempts={item.Attempts} error={item.ErrorType} message={item.Message}"));
+
+            return new CommandExecutionResult
+            {
+                ExitCode = failCount == 0 ? 0 : 1,
+                Message = string.Join(Environment.NewLine, lines),
+            };
+        }
+        catch (Exception ex)
+        {
+            return new CommandExecutionResult { ExitCode = 1, Message = $"Update failed: {ex.Message}" };
+        }
+    }
+
+    private CommandExecutionResult ExecuteSetNtp(ParsedCommand command)
+    {
+        if (command.Arguments.Count < 1)
+        {
+            return new CommandExecutionResult { ExitCode = 2, Message = "Missing NTP server IP. Usage: /set-ntp <ntp-ip>" };
+        }
+
+        var ntpIp = command.Arguments[0];
+        if (!IPAddress.TryParse(ntpIp, out _))
+        {
+            return new CommandExecutionResult { ExitCode = 2, Message = $"Invalid NTP IP: {ntpIp}" };
+        }
+
+        try
+        {
+            var settings = _settingsStore.Load(_paths.SettingsFilePath);
+            var cameraDocument = _cameraListStore.Load(
+                _paths.CamerasFilePath,
+                new CameraListStoreOptions
+                {
+                    EnableCredentialEncryption = settings.Security.ObfuscatePasswordsWithBase64,
+                });
+
+            var updated = 0;
+            foreach (var camera in cameraDocument.Cameras.Where(camera => camera.Enabled))
+            {
+                camera.NtpServerIp = ntpIp;
+                updated++;
+            }
+
+            _cameraListStore.Save(
+                _paths.CamerasFilePath,
+                cameraDocument,
+                new CameraListStoreOptions
+                {
+                    EnableCredentialEncryption = settings.Security.ObfuscatePasswordsWithBase64,
+                });
+
+            return new CommandExecutionResult
+            {
+                ExitCode = 0,
+                Message = $"Set-NTP completed. Applied {ntpIp} to {updated} enabled camera(s).",
+            };
+        }
+        catch (Exception ex)
+        {
+            return new CommandExecutionResult { ExitCode = 1, Message = $"Set-NTP failed: {ex.Message}" };
+        }
+    }
+
+    private static CameraUpdatePrecheckResult RunUpdatePrecheck(CameraRecord camera, AppSettings settings)
+    {
+        if (string.IsNullOrWhiteSpace(camera.Username) ||
+            (string.IsNullOrWhiteSpace(camera.Password) && string.IsNullOrWhiteSpace(camera.PasswordEncrypted)))
+        {
+            return CameraUpdatePrecheckResult.Fail(
+                camera,
+                0,
+                "auth",
+                "Missing username/password for update.");
+        }
+
+        var maxAttempts = settings.TimeUpdate.RetryCount + 1;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            if (settings.TimeUpdate.ReadSystemTimeBeforeEachUpdate)
+            {
+                _ = DateTimeOffset.Now;
+            }
+
+            try
+            {
+                var timeoutMs = Math.Max(1000, settings.TimeUpdate.RequestTimeoutSeconds * 1000);
+                if (CanConnect(camera.Ip, camera.Port, timeoutMs))
+                {
+                    return CameraUpdatePrecheckResult.Success(
+                        camera,
+                        attempt,
+                        "Connectivity precheck passed; ONVIF time-set transport will be integrated next.");
+                }
+
+                if (attempt == maxAttempts)
+                {
+                    return CameraUpdatePrecheckResult.Fail(
+                        camera,
+                        attempt,
+                        "timeout",
+                        "Timed out while connecting camera endpoint.");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                if (attempt == maxAttempts)
+                {
+                    return CameraUpdatePrecheckResult.Fail(
+                        camera,
+                        attempt,
+                        "timeout",
+                        "Timed out while connecting camera endpoint.");
+                }
+            }
+            catch (SocketException ex)
+            {
+                if (attempt == maxAttempts)
+                {
+                    return CameraUpdatePrecheckResult.Fail(camera, attempt, "network", ex.Message);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (attempt == maxAttempts)
+                {
+                    return CameraUpdatePrecheckResult.Fail(camera, attempt, "unknown", ex.Message);
+                }
+            }
+        }
+
+        return CameraUpdatePrecheckResult.Fail(camera, maxAttempts, "unknown", "Update precheck failed unexpectedly.");
+    }
+
+    private static bool CanConnect(string ip, int port, int timeoutMs)
+    {
+        using var client = new TcpClient();
+        using var cts = new CancellationTokenSource(timeoutMs);
+
+        var connectTask = client.ConnectAsync(ip, port, cts.Token).AsTask();
+        connectTask.Wait(cts.Token);
+        return client.Connected;
+    }
+
     private CommandExecutionResult ExecuteService(ParsedCommand command)
     {
         var runResult = (command.Action ?? string.Empty) switch
@@ -202,6 +378,26 @@ public sealed class CliCommandDispatcher
             ExitCode = runResult.ExitCode,
             Message = runResult.Output,
         };
+    }
+
+    private sealed record CameraUpdatePrecheckResult(
+        string CameraId,
+        string Ip,
+        int Port,
+        bool IsSuccess,
+        int Attempts,
+        string ErrorType,
+        string Message)
+    {
+        public static CameraUpdatePrecheckResult Success(CameraRecord camera, int attempts, string message)
+        {
+            return new CameraUpdatePrecheckResult(camera.Id, camera.Ip, camera.Port, true, attempts, "none", message);
+        }
+
+        public static CameraUpdatePrecheckResult Fail(CameraRecord camera, int attempts, string errorType, string message)
+        {
+            return new CameraUpdatePrecheckResult(camera.Id, camera.Ip, camera.Port, false, attempts, errorType, message);
+        }
     }
 
     private static string HelpText() =>

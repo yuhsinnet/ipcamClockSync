@@ -43,6 +43,8 @@ public sealed class CameraRecord
 
     public int ConnectionTimeoutSeconds { get; set; } = 15;
 
+    public string NtpServerIp { get; set; } = string.Empty;
+
     [JsonIgnore]
     public string EndpointKey => $"{Ip}:{Port}";
 
@@ -53,6 +55,7 @@ public sealed class CameraRecord
         Username = Username?.Trim() ?? string.Empty;
         Password ??= string.Empty;
         PasswordEncrypted ??= string.Empty;
+        NtpServerIp = NtpServerIp?.Trim() ?? string.Empty;
         Port = Port is <= 0 or > 65535 ? 80 : Port;
         ConnectionTimeoutSeconds = ConnectionTimeoutSeconds <= 0 ? 15 : ConnectionTimeoutSeconds;
     }

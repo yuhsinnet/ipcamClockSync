@@ -76,10 +76,16 @@ public sealed class TimeUpdateSettings
 
     public bool ReadSystemTimeBeforeEachUpdate { get; set; } = true;
 
+    public int RequestTimeoutSeconds { get; set; } = 5;
+
+    public int RetryCount { get; set; } = 2;
+
     public void Normalize()
     {
         Mode = string.IsNullOrWhiteSpace(Mode) ? "sequential" : Mode.Trim();
         MaxConcurrency = MaxConcurrency <= 0 ? 1 : MaxConcurrency;
+        RequestTimeoutSeconds = RequestTimeoutSeconds <= 0 ? 5 : RequestTimeoutSeconds;
+        RetryCount = RetryCount < 0 ? 0 : RetryCount;
     }
 }
 
