@@ -1,5 +1,6 @@
 <Solution>
   <Project Path="IPCamClockSync.Cli/IPCamClockSync.Cli.csproj" />
+  <Project Path="IPCamClockSync.ConsoleGui/IPCamClockSync.ConsoleGui.csproj" />
   <Project Path="IPCamClockSync.Core/IPCamClockSync.Core.csproj" />
   <Project Path="IPCamClockSync.NtpServer/IPCamClockSync.NtpServer.csproj" />
   <Project Path="IPCamClockSync.Tests/IPCamClockSync.Tests.csproj" />
