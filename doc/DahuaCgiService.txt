@@ -1,0 +1,768 @@
+using System.Globalization;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using IPCAM_Manger.Models;
+
+namespace IPCAM_Manger.Services
+{
+    public sealed class DahuaCredentialMatchResult
+    {
+        public bool IsMatched { get; init; }
+        public string Username { get; init; } = string.Empty;
+        public string Password { get; init; } = string.Empty;
+        public string Model { get; init; } = string.Empty;
+        public string FirmwareVersion { get; init; } = string.Empty;
+        public string SerialNumber { get; init; } = string.Empty;
+        public DateTime? CameraCurrentTime { get; init; }
+        public int Stream1Fps { get; init; }
+        public string Stream1Quality { get; init; } = string.Empty;
+        public int Stream2Fps { get; init; }
+        public string Stream2Quality { get; init; } = string.Empty;
+        public int Stream1Width { get; init; }
+        public int Stream1Height { get; init; }
+        public int Stream2Width { get; init; }
+        public int Stream2Height { get; init; }
+        public string Stream1Uri { get; init; } = string.Empty;
+        public string Stream2Uri { get; init; } = string.Empty;
+        public string Submask { get; init; } = string.Empty;
+        public string Gateway { get; init; } = string.Empty;
+        public bool? DhcpEnabled { get; init; }
+    }
+
+    public sealed class DahuaCgiService
+    {
+        private const string MainVecToken = "MainFormat";
+        private const string ExtraVecToken = "ExtraFormat";
+
+        public async Task<DahuaCredentialMatchResult> FindWorkingCredentialAsync(
+            string ipAddress,
+            IReadOnlyCollection<DeviceCredential> credentialLibrary,
+            string? deviceMacAddress,
+            CancellationToken cancellationToken)
+        {
+            if (credentialLibrary.Count == 0)
+            {
+                return new DahuaCredentialMatchResult();
+            }
+
+            IReadOnlyList<DeviceCredential> orderedCredentials = OrderCredentialsByOuiPriority(credentialLibrary, deviceMacAddress);
+            foreach (DeviceCredential credential in orderedCredentials)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                DahuaDeviceInfo? deviceInfo = await TryGetDeviceInfoAsync(ipAddress, credential.Username, credential.Password, cancellationToken);
+                if (deviceInfo == null)
+                {
+                    continue;
+                }
+
+                DahuaEncodeConfig encodeConfig = await TryGetEncodeConfigAsync(ipAddress, credential.Username, credential.Password, cancellationToken);
+                DahuaNetworkConfig networkConfig = await TryGetNetworkConfigAsync(ipAddress, credential.Username, credential.Password, cancellationToken);
+                DateTime? currentTime = await TryGetCurrentTimeAsync(ipAddress, credential.Username, credential.Password, cancellationToken);
+
+                (string stream1Uri, string stream2Uri) = BuildRtspUris(ipAddress, credential.Username, credential.Password);
+
+                return new DahuaCredentialMatchResult
+                {
+                    IsMatched = true,
+                    Username = credential.Username,
+                    Password = credential.Password,
+                    Model = deviceInfo.Model,
+                    FirmwareVersion = deviceInfo.FirmwareVersion,
+                    SerialNumber = deviceInfo.SerialNumber,
+                    CameraCurrentTime = currentTime,
+                    Stream1Fps = encodeConfig.MainFps,
+                    Stream1Quality = BuildQualityLabel(encodeConfig.MainWidth, encodeConfig.MainHeight),
+                    Stream2Fps = encodeConfig.ExtraFps,
+                    Stream2Quality = BuildQualityLabel(encodeConfig.ExtraWidth, encodeConfig.ExtraHeight),
+                    Stream1Width = encodeConfig.MainWidth,
+                    Stream1Height = encodeConfig.MainHeight,
+                    Stream2Width = encodeConfig.ExtraWidth,
+                    Stream2Height = encodeConfig.ExtraHeight,
+                    Stream1Uri = stream1Uri,
+                    Stream2Uri = stream2Uri,
+                    Submask = networkConfig.Submask,
+                    Gateway = networkConfig.Gateway,
+                    DhcpEnabled = networkConfig.DhcpEnabled
+                };
+            }
+
+            return new DahuaCredentialMatchResult();
+        }
+
+        public async Task<OnvifConfigResult> TrySetSystemDateAndTimeAsync(
+            string ipAddress,
+            string username,
+            string password,
+            DateTime localTime,
+            CancellationToken cancellationToken)
+        {
+            string timeValue = localTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+            string path = $"/cgi-bin/global.cgi?action=setCurrentTime&time={Uri.EscapeDataString(timeValue)}";
+            string? response = await SendGetAsync(ipAddress, path, username, password, cancellationToken);
+            return IsSuccessfulResponse(response)
+                ? OnvifConfigResult.Ok()
+                : OnvifConfigResult.Fail("Dahua CGI 設定時間失敗");
+        }
+
+        public async Task<OnvifConfigResult> TrySetVideoEncoderConfigAsync(
+            string ipAddress,
+            string username,
+            string password,
+            int streamIndex,
+            int fps,
+            int width,
+            int height,
+            CancellationToken cancellationToken)
+        {
+            string prefix = streamIndex == 1
+                ? "Encode[0].MainFormat[0].Video"
+                : "Encode[0].ExtraFormat[0].Video";
+
+            string path = $"/cgi-bin/configManager.cgi?action=setConfig&{prefix}.FPS={fps}&{prefix}.Width={width}&{prefix}.Height={height}";
+            string? response = await SendGetAsync(ipAddress, path, username, password, cancellationToken);
+            if (!IsSuccessfulResponse(response))
+            {
+                return OnvifConfigResult.Fail($"Dahua CGI 設定串流 {streamIndex} 失敗");
+            }
+
+            // Confirm actual camera state after setConfig; only report success when FPS is truly applied.
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                DahuaEncodeConfig verify = await TryGetEncodeConfigAsync(ipAddress, username, password, cancellationToken);
+                int actualFps = streamIndex == 1 ? verify.MainFps : verify.ExtraFps;
+                if (actualFps == fps)
+                {
+                    return OnvifConfigResult.Ok();
+                }
+
+                if (attempt == 0)
+                {
+                    await Task.Delay(300, cancellationToken);
+                }
+            }
+
+            DahuaEncodeConfig finalVerify = await TryGetEncodeConfigAsync(ipAddress, username, password, cancellationToken);
+            int finalFps = streamIndex == 1 ? finalVerify.MainFps : finalVerify.ExtraFps;
+            return OnvifConfigResult.Fail(
+                $"Dahua 串流 {streamIndex} 張數驗證失敗（目標 {fps}，目前 {finalFps}）");
+        }
+
+        public async Task<OnvifConfigResult> TrySetNetworkStaticIpAsync(
+            string ipAddress,
+            string username,
+            string password,
+            string newIp,
+            string submask,
+            string gateway,
+            CancellationToken cancellationToken)
+        {
+            var builder = new StringBuilder("/cgi-bin/configManager.cgi?action=setConfig");
+            builder.Append("&Network.eth0.DhcpEnable=false");
+            builder.Append($"&Network.eth0.IPAddress={Uri.EscapeDataString(newIp)}");
+            builder.Append($"&Network.eth0.SubnetMask={Uri.EscapeDataString(submask)}");
+            if (!string.IsNullOrWhiteSpace(gateway))
+            {
+                builder.Append($"&Network.eth0.DefaultGateway={Uri.EscapeDataString(gateway)}");
+            }
+
+            string? response = await SendGetAsync(ipAddress, builder.ToString(), username, password, cancellationToken);
+            return IsSuccessfulResponse(response)
+                ? OnvifConfigResult.Ok()
+                : OnvifConfigResult.Fail("Dahua CGI 設定靜態 IP 失敗");
+        }
+
+        public async Task<OnvifConfigResult> TrySetNetworkDhcpAsync(
+            string ipAddress,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            string path = "/cgi-bin/configManager.cgi?action=setConfig&Network.eth0.DhcpEnable=true";
+            string? response = await SendGetAsync(ipAddress, path, username, password, cancellationToken);
+            return IsSuccessfulResponse(response)
+                ? OnvifConfigResult.Ok()
+                : OnvifConfigResult.Fail("Dahua CGI 啟用 DHCP 失敗");
+        }
+
+        public async Task<OnvifConfigResult> TrySetUserPasswordAsync(
+            string ipAddress,
+            string username,
+            string currentPassword,
+            string newPassword,
+            CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(newPassword))
+            {
+                return OnvifConfigResult.Fail("新密碼不可為空");
+            }
+
+            string encodedName = Uri.EscapeDataString(username);
+            string encodedOld = Uri.EscapeDataString(currentPassword);
+            string encodedNew = Uri.EscapeDataString(newPassword);
+
+            // Each entry: (endpoint, body/query string)
+            // Tried in order; exceptions (e.g. server FIN with no HTTP response) are caught and skipped.
+            // 1. userManager.cgi variants (IPC/DVR style)
+            // 2. global.cgi setCurrentUserInfo (PTZ/NVR style — e.g. DH-2H3400-ADPZ)
+            var postAttempts = new (string Path, string Body)[]
+            {
+                ("/cgi-bin/userManager.cgi?action=modifyPassword",
+                    $"name={encodedName}&oldPassword={encodedOld}&password={encodedNew}"),
+                ("/cgi-bin/userManager.cgi?action=modifyPassword",
+                    $"name={encodedName}&pwd={encodedOld}&newPwd={encodedNew}"),
+                ("/cgi-bin/userManager.cgi?action=modifyPassword",
+                    $"name={encodedName}&oldPwd={encodedOld}&newPwd={encodedNew}"),
+                ("/cgi-bin/global.cgi?action=setCurrentUserInfo",
+                    $"UserInfo.Name={encodedName}&UserInfo.Password={encodedNew}"),
+            };
+
+            var getAttempts = new string[]
+            {
+                $"/cgi-bin/userManager.cgi?action=modifyPassword&name={encodedName}&oldPassword={encodedOld}&password={encodedNew}",
+                $"/cgi-bin/userManager.cgi?action=modifyPassword&name={encodedName}&pwd={encodedOld}&newPwd={encodedNew}",
+                $"/cgi-bin/userManager.cgi?action=modifyPassword&name={encodedName}&oldPwd={encodedOld}&newPwd={encodedNew}",
+                $"/cgi-bin/global.cgi?action=setCurrentUserInfo&UserInfo.Name={encodedName}&UserInfo.Password={encodedNew}",
+            };
+
+            string lastError = "Dahua CGI 修改密碼失敗";
+
+            foreach ((string path, string body) in postAttempts)
+            {
+                DahuaHttpResult result;
+                try
+                {
+                    result = await SendPostWithStatusAsync(ipAddress, path, body, username, currentPassword, cancellationToken);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Server closed connection without HTTP response (e.g. Dahua PTZ FIN behaviour)
+                    lastError = $"CGI POST 無回應（{ex.GetType().Name}）";
+                    continue;
+                }
+
+                if (IsSuccessfulPasswordChangeResponse(result))
+                    return OnvifConfigResult.Ok();
+
+                if (result.IsUnauthorized)
+                    return OnvifConfigResult.Fail("密碼驗證失敗（舊密碼錯誤或權限不足）");
+
+                lastError = BuildPasswordChangeError(result);
+            }
+
+            foreach (string pathAndQuery in getAttempts)
+            {
+                DahuaHttpResult result;
+                try
+                {
+                    result = await SendGetWithStatusAsync(ipAddress, pathAndQuery, username, currentPassword, cancellationToken);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    lastError = $"CGI GET 無回應（{ex.GetType().Name}）";
+                    continue;
+                }
+
+                if (IsSuccessfulPasswordChangeResponse(result))
+                    return OnvifConfigResult.Ok();
+
+                if (result.IsUnauthorized)
+                    return OnvifConfigResult.Fail("密碼驗證失敗（舊密碼錯誤或權限不足）");
+
+                lastError = BuildPasswordChangeError(result);
+            }
+
+            return OnvifConfigResult.Fail(lastError);
+        }
+
+        public static bool IsDahuaVecToken(string? vecToken)
+        {
+            return string.Equals(vecToken, MainVecToken, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(vecToken, ExtraVecToken, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private async Task<DahuaDeviceInfo?> TryGetDeviceInfoAsync(
+            string ipAddress,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            string? typeResponse = await SendGetAsync(
+                ipAddress,
+                "/cgi-bin/magicBox.cgi?action=getDeviceType",
+                username,
+                password,
+                cancellationToken);
+            if (!IsSuccessfulResponse(typeResponse))
+            {
+                return null;
+            }
+
+            string? swResponse = await SendGetAsync(
+                ipAddress,
+                "/cgi-bin/magicBox.cgi?action=getSoftwareVersion",
+                username,
+                password,
+                cancellationToken);
+            string? snResponse = await SendGetAsync(
+                ipAddress,
+                "/cgi-bin/magicBox.cgi?action=getSerialNo",
+                username,
+                password,
+                cancellationToken);
+
+            IReadOnlyDictionary<string, string> typeKv = ParseKvLines(typeResponse!);
+            IReadOnlyDictionary<string, string> swKv = ParseKvLines(swResponse ?? string.Empty);
+            IReadOnlyDictionary<string, string> snKv = ParseKvLines(snResponse ?? string.Empty);
+
+            return new DahuaDeviceInfo
+            {
+                Model = GetFirstValue(typeKv, "table.DeviceType", "DeviceType", "type") ?? string.Empty,
+                FirmwareVersion = GetFirstValue(swKv, "table.SoftwareVersion", "SoftwareVersion") ?? string.Empty,
+                SerialNumber = GetFirstValue(snKv, "table.SerialNo", "SerialNo") ?? string.Empty,
+            };
+        }
+
+        private async Task<DahuaEncodeConfig> TryGetEncodeConfigAsync(
+            string ipAddress,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            string? response = await SendGetAsync(
+                ipAddress,
+                "/cgi-bin/configManager.cgi?action=getConfig&name=Encode",
+                username,
+                password,
+                cancellationToken);
+
+            if (!IsSuccessfulResponse(response))
+            {
+                return new DahuaEncodeConfig();
+            }
+
+            IReadOnlyDictionary<string, string> kv = ParseKvLines(response!);
+            int mainFps = ParseInt(GetFirstValue(kv,
+                "table.Encode[0].MainFormat[0].Video.FPS",
+                "Encode[0].MainFormat[0].Video.FPS"));
+            int mainWidth = ParseInt(GetFirstValue(kv,
+                "table.Encode[0].MainFormat[0].Video.Width",
+                "Encode[0].MainFormat[0].Video.Width"));
+            int mainHeight = ParseInt(GetFirstValue(kv,
+                "table.Encode[0].MainFormat[0].Video.Height",
+                "Encode[0].MainFormat[0].Video.Height"));
+
+            int extraFps = ParseInt(GetFirstValue(kv,
+                "table.Encode[0].ExtraFormat[0].Video.FPS",
+                "Encode[0].ExtraFormat[0].Video.FPS"));
+            int extraWidth = ParseInt(GetFirstValue(kv,
+                "table.Encode[0].ExtraFormat[0].Video.Width",
+                "Encode[0].ExtraFormat[0].Video.Width"));
+            int extraHeight = ParseInt(GetFirstValue(kv,
+                "table.Encode[0].ExtraFormat[0].Video.Height",
+                "Encode[0].ExtraFormat[0].Video.Height"));
+
+            return new DahuaEncodeConfig
+            {
+                MainFps = mainFps,
+                MainWidth = mainWidth,
+                MainHeight = mainHeight,
+                ExtraFps = extraFps,
+                ExtraWidth = extraWidth,
+                ExtraHeight = extraHeight,
+            };
+        }
+
+        private async Task<DahuaNetworkConfig> TryGetNetworkConfigAsync(
+            string ipAddress,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            string? response = await SendGetAsync(
+                ipAddress,
+                "/cgi-bin/configManager.cgi?action=getConfig&name=Network",
+                username,
+                password,
+                cancellationToken);
+
+            if (!IsSuccessfulResponse(response))
+            {
+                return new DahuaNetworkConfig();
+            }
+
+            IReadOnlyDictionary<string, string> kv = ParseKvLines(response!);
+            bool? dhcp = ParseBool(GetFirstValue(kv,
+                "table.Network.eth0.DhcpEnable",
+                "Network.eth0.DhcpEnable"));
+
+            return new DahuaNetworkConfig
+            {
+                Submask = GetFirstValue(kv,
+                    "table.Network.eth0.SubnetMask",
+                    "Network.eth0.SubnetMask") ?? string.Empty,
+                Gateway = GetFirstValue(kv,
+                    "table.Network.eth0.DefaultGateway",
+                    "Network.eth0.DefaultGateway") ?? string.Empty,
+                DhcpEnabled = dhcp,
+            };
+        }
+
+        private async Task<DateTime?> TryGetCurrentTimeAsync(
+            string ipAddress,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            string? response = await SendGetAsync(
+                ipAddress,
+                "/cgi-bin/global.cgi?action=getCurrentTime",
+                username,
+                password,
+                cancellationToken);
+
+            if (!IsSuccessfulResponse(response))
+            {
+                return null;
+            }
+
+            IReadOnlyDictionary<string, string> kv = ParseKvLines(response!);
+            string? timeText = GetFirstValue(kv, "result", "CurrentTime", "time");
+            if (string.IsNullOrWhiteSpace(timeText))
+            {
+                return null;
+            }
+
+            return DateTime.TryParse(timeText, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out DateTime dt)
+                ? dt
+                : null;
+        }
+
+        private static (string Stream1Uri, string Stream2Uri) BuildRtspUris(string ipAddress, string username, string password)
+        {
+            string escapedUser = Uri.EscapeDataString(username);
+            string escapedPassword = Uri.EscapeDataString(password);
+            string stream1 = $"rtsp://{escapedUser}:{escapedPassword}@{ipAddress}:554/cam/realmonitor?channel=1&subtype=0";
+            string stream2 = $"rtsp://{escapedUser}:{escapedPassword}@{ipAddress}:554/cam/realmonitor?channel=1&subtype=1";
+            return (stream1, stream2);
+        }
+
+        private static async Task<string?> SendGetAsync(
+            string ipAddress,
+            string pathAndQuery,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            DahuaHttpResult result = await SendGetWithStatusAsync(
+                ipAddress,
+                pathAndQuery,
+                username,
+                password,
+                cancellationToken);
+            return result.IsSuccessStatusCode ? result.Body : null;
+        }
+
+        private static async Task<string?> SendPostAsync(
+            string ipAddress,
+            string path,
+            string body,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            DahuaHttpResult result = await SendPostWithStatusAsync(
+                ipAddress,
+                path,
+                body,
+                username,
+                password,
+                cancellationToken);
+            return result.IsSuccessStatusCode ? result.Body : null;
+        }
+
+        private static async Task<DahuaHttpResult> SendGetWithStatusAsync(
+            string ipAddress,
+            string pathAndQuery,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            using var handler = new HttpClientHandler
+            {
+                Credentials = new NetworkCredential(username, password),
+                PreAuthenticate = false,
+                UseProxy = false
+            };
+
+            using var client = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromSeconds(8)
+            };
+
+            Uri uri = BuildUri(ipAddress, pathAndQuery);
+            using HttpResponseMessage response = await client.GetAsync(uri, cancellationToken);
+            string content = await response.Content.ReadAsStringAsync(cancellationToken);
+            return new DahuaHttpResult(response.StatusCode, content);
+        }
+
+        private static async Task<DahuaHttpResult> SendPostWithStatusAsync(
+            string ipAddress,
+            string path,
+            string body,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            using var handler = new HttpClientHandler
+            {
+                Credentials = new NetworkCredential(username, password),
+                PreAuthenticate = false,
+                UseProxy = false
+            };
+
+            using var client = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromSeconds(8)
+            };
+
+            using var content = new StringContent(body, Encoding.UTF8, "application/x-www-form-urlencoded");
+            Uri uri = BuildUri(ipAddress, path);
+            using HttpResponseMessage response = await client.PostAsync(uri, content, cancellationToken);
+            string responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+            return new DahuaHttpResult(response.StatusCode, responseBody);
+        }
+
+        private static Uri BuildUri(string ipAddress, string pathAndQuery)
+        {
+            if (ipAddress.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                || ipAddress.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                return new Uri($"{ipAddress.TrimEnd('/')}{pathAndQuery}");
+            }
+
+            return new Uri($"http://{ipAddress.Trim('/')}{pathAndQuery}");
+        }
+
+        private static IReadOnlyDictionary<string, string> ParseKvLines(string body)
+        {
+            Dictionary<string, string> result = new(StringComparer.OrdinalIgnoreCase);
+            string[] lines = body.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string line in lines)
+            {
+                int idx = line.IndexOf('=');
+                if (idx <= 0 || idx == line.Length - 1)
+                {
+                    continue;
+                }
+
+                string key = line[..idx].Trim();
+                string value = line[(idx + 1)..].Trim();
+                if (key.Length == 0)
+                {
+                    continue;
+                }
+
+                result[key] = value;
+            }
+
+            return result;
+        }
+
+        private static bool IsSuccessfulResponse(string? response)
+        {
+            if (string.IsNullOrWhiteSpace(response))
+            {
+                return false;
+            }
+
+            if (response.Contains("Error", StringComparison.OrdinalIgnoreCase)
+                || response.Contains("failed", StringComparison.OrdinalIgnoreCase)
+                || response.Contains("Invalid", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool IsSuccessfulPasswordChangeResponse(DahuaHttpResult result)
+        {
+            if (!result.IsSuccessStatusCode || string.IsNullOrWhiteSpace(result.Body))
+            {
+                return false;
+            }
+
+            return !result.Body.Contains("Error", StringComparison.OrdinalIgnoreCase)
+                && !result.Body.Contains("failed", StringComparison.OrdinalIgnoreCase)
+                && !result.Body.Contains("Invalid", StringComparison.OrdinalIgnoreCase)
+                && !result.Body.Contains("unauthorized", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string BuildPasswordChangeError(DahuaHttpResult result)
+        {
+            if (result.IsUnauthorized)
+            {
+                return "密碼驗證失敗（舊密碼錯誤或權限不足）";
+            }
+
+            string body = result.Body ?? string.Empty;
+            string bodyLine = body
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .FirstOrDefault()
+                ?? string.Empty;
+
+            if (string.IsNullOrWhiteSpace(bodyLine))
+            {
+                return $"Dahua CGI 修改密碼失敗（HTTP {(int)result.StatusCode}）";
+            }
+
+            if (bodyLine.Length > 120)
+            {
+                bodyLine = bodyLine[..120] + "...";
+            }
+
+            return $"Dahua CGI 修改密碼失敗（HTTP {(int)result.StatusCode}: {bodyLine}）";
+        }
+
+        private static string? GetFirstValue(IReadOnlyDictionary<string, string> kv, params string[] keys)
+        {
+            foreach (string key in keys)
+            {
+                if (kv.TryGetValue(key, out string? value) && !string.IsNullOrWhiteSpace(value))
+                {
+                    return value;
+                }
+            }
+
+            return null;
+        }
+
+        private static int ParseInt(string? value)
+        {
+            return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int number) ? number : 0;
+        }
+
+        private static bool? ParseBool(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return null;
+            }
+
+            return value.Equals("true", StringComparison.OrdinalIgnoreCase)
+                || value.Equals("1", StringComparison.OrdinalIgnoreCase)
+                || value.Equals("on", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string BuildQualityLabel(int width, int height)
+        {
+            if (width <= 0 || height <= 0)
+            {
+                return string.Empty;
+            }
+
+            string tier = string.Empty;
+            if (height >= 2160 || width >= 3840) tier = "4K";
+            else if (height >= 1440 || width >= 2560) tier = "2K";
+            else if (height >= 1080 || width >= 1920) tier = "1080";
+            else if (height >= 720 || width >= 1280) tier = "720";
+            else if (height >= 480 || width >= 640) tier = "480";
+            else if (height >= 360 || width >= 480) tier = "360";
+
+            return string.IsNullOrWhiteSpace(tier)
+                ? $"{width} × {height}"
+                : $"{width} × {height} ({tier})";
+        }
+
+        private static IReadOnlyList<DeviceCredential> OrderCredentialsByOuiPriority(
+            IReadOnlyCollection<DeviceCredential> credentialLibrary,
+            string? deviceMacAddress)
+        {
+            List<DeviceCredential> credentialList = credentialLibrary.ToList();
+            string? deviceOui = TryExtractOuiFromMac(deviceMacAddress);
+            if (string.IsNullOrWhiteSpace(deviceOui))
+            {
+                return credentialList;
+            }
+
+            List<DeviceCredential> prioritized = [];
+            List<DeviceCredential> regular = [];
+            foreach (DeviceCredential credential in credentialList)
+            {
+                IReadOnlyCollection<string> priorityOuiSet = credential.GetPriorityOuiSet();
+                if (priorityOuiSet.Contains(deviceOui, StringComparer.OrdinalIgnoreCase))
+                {
+                    prioritized.Add(credential);
+                }
+                else
+                {
+                    regular.Add(credential);
+                }
+            }
+
+            prioritized.AddRange(regular);
+            return prioritized;
+        }
+
+        private static string? TryExtractOuiFromMac(string? macAddress)
+        {
+            if (string.IsNullOrWhiteSpace(macAddress))
+            {
+                return null;
+            }
+
+            string normalized = new string(macAddress
+                .Where(char.IsLetterOrDigit)
+                .ToArray())
+                .ToUpperInvariant();
+
+            if (normalized.Length < 6)
+            {
+                return null;
+            }
+
+            string candidate = normalized[..6];
+            return candidate.All(Uri.IsHexDigit) ? candidate : null;
+        }
+
+        private sealed class DahuaDeviceInfo
+        {
+            public string Model { get; init; } = string.Empty;
+            public string FirmwareVersion { get; init; } = string.Empty;
+            public string SerialNumber { get; init; } = string.Empty;
+        }
+
+        private sealed class DahuaEncodeConfig
+        {
+            public int MainFps { get; init; }
+            public int MainWidth { get; init; }
+            public int MainHeight { get; init; }
+            public int ExtraFps { get; init; }
+            public int ExtraWidth { get; init; }
+            public int ExtraHeight { get; init; }
+        }
+
+        private sealed class DahuaNetworkConfig
+        {
+            public string Submask { get; init; } = string.Empty;
+            public string Gateway { get; init; } = string.Empty;
+            public bool? DhcpEnabled { get; init; }
+        }
+
+        private readonly struct DahuaHttpResult
+        {
+            public DahuaHttpResult(HttpStatusCode statusCode, string body)
+            {
+                StatusCode = statusCode;
+                Body = body ?? string.Empty;
+            }
+
+            public HttpStatusCode StatusCode { get; }
+            public string Body { get; }
+            public bool IsSuccessStatusCode => (int)StatusCode >= 200 && (int)StatusCode <= 299;
+            public bool IsUnauthorized => StatusCode == HttpStatusCode.Unauthorized;
+        }
+    }
+}

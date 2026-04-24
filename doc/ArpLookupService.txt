@@ -1,0 +1,60 @@
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+
+namespace IPCAM_Manger.Services
+{
+    public class ArpLookupService
+    {
+        [DllImport("iphlpapi.dll", ExactSpelling = true)]
+        private static extern int SendARP(int destinationIp, int sourceIp, byte[] macAddress, ref int physicalAddressLength);
+
+        public async Task<string?> TryResolveMacAddressAsync(IPAddress targetIp, IPAddress sourceIp, CancellationToken cancellationToken)
+        {
+            if (targetIp.AddressFamily != AddressFamily.InterNetwork || sourceIp.AddressFamily != AddressFamily.InterNetwork)
+            {
+                return null;
+            }
+
+            try
+            {
+                using var ping = new Ping();
+                await ping.SendPingAsync(targetIp, 500);
+            }
+            catch
+            {
+                // Ping 失敗不直接中斷，仍嘗試 ARP
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            return ResolveMacViaArp(targetIp, sourceIp);
+        }
+
+        private static string? ResolveMacViaArp(IPAddress targetIp, IPAddress sourceIp)
+        {
+            byte[] destinationBytes = targetIp.GetAddressBytes();
+            byte[] sourceBytes = sourceIp.GetAddressBytes();
+            int destination = BitConverter.ToInt32(destinationBytes, 0);
+            int source = BitConverter.ToInt32(sourceBytes, 0);
+
+            int macAddressLength = 6;
+            byte[] macAddress = new byte[macAddressLength];
+
+            int result = SendARP(destination, source, macAddress, ref macAddressLength);
+            if (result != 0 || macAddressLength == 0)
+            {
+                return null;
+            }
+
+            byte[] finalMac = macAddress.Take(macAddressLength).ToArray();
+            if (finalMac.All(b => b == 0))
+            {
+                return null;
+            }
+
+            return string.Join(":", finalMac.Select(b => b.ToString("X2")));
+        }
+    }
+}
+

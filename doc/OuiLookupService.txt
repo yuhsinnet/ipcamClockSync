@@ -1,0 +1,176 @@
+using System.IO;
+using System.Text;
+
+namespace IPCAM_Manger.Services
+{
+    public class OuiLookupService
+    {
+        private readonly string _csvPath;
+        private readonly Dictionary<string, string> _assignmentToOrganization;
+        private bool _isLoaded;
+        private readonly object _syncLock = new();
+
+        public OuiLookupService(string csvPath)
+        {
+            _csvPath = csvPath;
+            _assignmentToOrganization = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        public string ResolveOuiDisplay(string? macAddress)
+        {
+            string? assignment = NormalizeMacToAssignment(macAddress);
+            if (assignment == null)
+            {
+                return "未知";
+            }
+
+            EnsureLoaded();
+
+            string ouiPrefix = $"{assignment[..2]}:{assignment[2..4]}:{assignment[4..6]}";
+            return _assignmentToOrganization.TryGetValue(assignment, out string? organization)
+                ? $"{ouiPrefix} ({organization})"
+                : $"{ouiPrefix} (未知)";
+        }
+
+        private void EnsureLoaded()
+        {
+            if (_isLoaded)
+            {
+                return;
+            }
+
+            lock (_syncLock)
+            {
+                if (_isLoaded)
+                {
+                    return;
+                }
+
+                if (!File.Exists(_csvPath))
+                {
+                    _isLoaded = true;
+                    return;
+                }
+
+                using var stream = new FileStream(_csvPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+
+                bool isFirstLine = true;
+                while (!reader.EndOfStream)
+                {
+                    string? line = reader.ReadLine();
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        continue;
+                    }
+
+                    if (isFirstLine)
+                    {
+                        isFirstLine = false;
+                        if (line.StartsWith("Registry", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+                    }
+
+                    List<string> fields = ParseCsvLine(line);
+                    if (fields.Count < 3)
+                    {
+                        continue;
+                    }
+
+                    string? assignment = NormalizeAssignment(fields[1]);
+                    if (assignment == null)
+                    {
+                        continue;
+                    }
+
+                    string organization = fields[2].Trim();
+                    if (string.IsNullOrWhiteSpace(organization))
+                    {
+                        continue;
+                    }
+
+                    _assignmentToOrganization[assignment] = organization;
+                }
+
+                _isLoaded = true;
+            }
+        }
+
+        private static string? NormalizeMacToAssignment(string? macAddress)
+        {
+            if (string.IsNullOrWhiteSpace(macAddress))
+            {
+                return null;
+            }
+
+            string normalized = new string(macAddress
+                .Where(char.IsLetterOrDigit)
+                .ToArray())
+                .ToUpperInvariant();
+
+            if (normalized.Length < 6)
+            {
+                return null;
+            }
+
+            return normalized[..6];
+        }
+
+        private static string? NormalizeAssignment(string assignment)
+        {
+            if (string.IsNullOrWhiteSpace(assignment))
+            {
+                return null;
+            }
+
+            string normalized = new string(assignment
+                .Where(char.IsLetterOrDigit)
+                .ToArray())
+                .ToUpperInvariant();
+
+            return normalized.Length == 6 ? normalized : null;
+        }
+
+        private static List<string> ParseCsvLine(string line)
+        {
+            var fields = new List<string>();
+            var builder = new StringBuilder();
+            bool insideQuote = false;
+
+            for (int index = 0; index < line.Length; index++)
+            {
+                char currentChar = line[index];
+
+                if (currentChar == '"')
+                {
+                    if (insideQuote && index + 1 < line.Length && line[index + 1] == '"')
+                    {
+                        builder.Append('"');
+                        index++;
+                    }
+                    else
+                    {
+                        insideQuote = !insideQuote;
+                    }
+
+                    continue;
+                }
+
+                if (currentChar == ',' && !insideQuote)
+                {
+                    fields.Add(builder.ToString());
+                    builder.Clear();
+                    continue;
+                }
+
+                builder.Append(currentChar);
+            }
+
+            fields.Add(builder.ToString());
+            return fields;
+        }
+    }
+}
+

@@ -1,0 +1,20 @@
+using System;
+using System.Diagnostics;
+using System.Windows;
+
+namespace IPCAM_Manger.Services
+{
+    public static class TouchInputDebugLogService
+    {
+        public static void Log(string message)
+        {
+#if DEBUG
+            Application.Current?.Dispatcher.Invoke(() =>
+            {
+                string line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+                Debug.WriteLine(line);
+            });
+#endif
+        }
+    }
+}

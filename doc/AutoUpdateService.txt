@@ -1,0 +1,202 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Reflection;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace IPCAM_Manger.Services
+{
+    /// <summary>
+    /// 自動更新服務：在背景檢查 GitHub Releases，若有新版本則通知呼叫者。
+    /// </summary>
+    public sealed class AutoUpdateService : IDisposable
+    {
+        private const string GitHubApiReleaseUrl =
+            "https://api.github.com/repos/yuhsinnet/IPCAM_Manger/releases/latest";
+
+        private readonly HttpClient _httpClient;
+
+        public AutoUpdateService()
+        {
+            _httpClient = new HttpClient();
+            _httpClient.DefaultRequestHeaders.UserAgent.Add(
+                new ProductInfoHeaderValue("IPCAM_Manger", GetCurrentVersion()));
+            _httpClient.Timeout = TimeSpan.FromSeconds(15);
+        }
+
+        /// <summary>
+        /// 目前應用程式版本（來自組件資訊）。
+        /// </summary>
+        public static string GetCurrentVersion()
+        {
+            Version? version = Assembly.GetExecutingAssembly().GetName().Version;
+            return version != null ? $"{version.Major}.{version.Minor}.{version.Build}" : "0.0.0";
+        }
+
+        /// <summary>
+        /// 非同步檢查是否有可用的新版本。
+        /// </summary>
+        /// <param name="cancellationToken">取消權杖</param>
+        /// <returns>若有新版本則回傳 <see cref="ReleaseInfo"/>；否則回傳 <c>null</c>。</returns>
+        public async Task<ReleaseInfo?> CheckForUpdateAsync(CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                string json = await _httpClient.GetStringAsync(GitHubApiReleaseUrl, cancellationToken)
+                    .ConfigureAwait(false);
+
+                using JsonDocument doc = JsonDocument.Parse(json);
+                JsonElement root = doc.RootElement;
+
+                if (!root.TryGetProperty("tag_name", out JsonElement tagNameEl))
+                {
+                    return null;
+                }
+
+                string tagName = tagNameEl.GetString() ?? string.Empty;
+                string latestVersionStr = tagName.TrimStart('v');
+
+                if (!Version.TryParse(latestVersionStr, out Version? latestVersion))
+                {
+                    return null;
+                }
+
+                string currentVersionStr = GetCurrentVersion();
+                if (!Version.TryParse(currentVersionStr, out Version? currentVersion))
+                {
+                    return null;
+                }
+
+                if (latestVersion <= currentVersion)
+                {
+                    return null;
+                }
+
+                string releaseUrl = root.TryGetProperty("html_url", out JsonElement urlEl)
+                    ? (urlEl.GetString() ?? string.Empty)
+                    : string.Empty;
+
+                string releaseNotes = root.TryGetProperty("body", out JsonElement bodyEl)
+                    ? (bodyEl.GetString() ?? string.Empty)
+                    : string.Empty;
+
+                // 找到 Setup.exe 或 Portable.zip 的下載 URL
+                string downloadUrl = string.Empty;
+                if (root.TryGetProperty("assets", out JsonElement assetsEl))
+                {
+                    foreach (JsonElement asset in assetsEl.EnumerateArray())
+                    {
+                        if (!asset.TryGetProperty("name", out JsonElement nameEl))
+                        {
+                            continue;
+                        }
+
+                        string assetName = nameEl.GetString() ?? string.Empty;
+                        if (assetName.EndsWith("_Setup.exe", StringComparison.OrdinalIgnoreCase))
+                        {
+                            downloadUrl = asset.TryGetProperty("browser_download_url", out JsonElement dlEl)
+                                ? (dlEl.GetString() ?? string.Empty)
+                                : string.Empty;
+                            break;
+                        }
+                    }
+
+                    // 若無安裝檔，退而求其次選 Portable.zip
+                    if (string.IsNullOrEmpty(downloadUrl))
+                    {
+                        foreach (JsonElement asset in assetsEl.EnumerateArray())
+                        {
+                            if (!asset.TryGetProperty("name", out JsonElement nameEl))
+                            {
+                                continue;
+                            }
+
+                            string assetName = nameEl.GetString() ?? string.Empty;
+                            if (assetName.EndsWith("_Portable.zip", StringComparison.OrdinalIgnoreCase))
+                            {
+                                downloadUrl = asset.TryGetProperty("browser_download_url", out JsonElement dlEl)
+                                    ? (dlEl.GetString() ?? string.Empty)
+                                    : string.Empty;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                return new ReleaseInfo(
+                    latestVersionStr,
+                    tagName,
+                    releaseUrl,
+                    downloadUrl,
+                    releaseNotes);
+            }
+            catch (OperationCanceledException)
+            {
+                return null;
+            }
+            catch
+            {
+                // 更新檢查失敗不影響主程式運作
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 使用預設瀏覽器開啟 Release 頁面，讓使用者手動下載。
+        /// </summary>
+        public static void OpenReleasePage(string releaseUrl)
+        {
+            if (string.IsNullOrWhiteSpace(releaseUrl))
+            {
+                releaseUrl = "https://github.com/yuhsinnet/IPCAM_Manger/releases/latest";
+            }
+
+            Process.Start(new ProcessStartInfo(releaseUrl) { UseShellExecute = true });
+        }
+
+        /// <inheritdoc/>
+        public void Dispose()
+        {
+            _httpClient.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 代表一個可用的 GitHub Release。
+    /// </summary>
+    public sealed class ReleaseInfo
+    {
+        public ReleaseInfo(
+            string version,
+            string tagName,
+            string releasePageUrl,
+            string downloadUrl,
+            string releaseNotes)
+        {
+            Version = version;
+            TagName = tagName;
+            ReleasePageUrl = releasePageUrl;
+            DownloadUrl = downloadUrl;
+            ReleaseNotes = releaseNotes;
+        }
+
+        /// <summary>版本號（例如 "1.2.3"）</summary>
+        public string Version { get; }
+
+        /// <summary>Git tag 名稱（例如 "v1.2.3"）</summary>
+        public string TagName { get; }
+
+        /// <summary>GitHub Release 頁面 URL</summary>
+        public string ReleasePageUrl { get; }
+
+        /// <summary>直接下載 URL（Setup.exe 或 Portable.zip）</summary>
+        public string DownloadUrl { get; }
+
+        /// <summary>Release 說明</summary>
+        public string ReleaseNotes { get; }
+    }
+}

@@ -1,0 +1,426 @@
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Xml.Linq;
+
+namespace IPCAM_Manger.Services
+{
+    /// <summary>每次設定操作的結果</summary>
+    public class OnvifConfigResult
+    {
+        public bool IsSuccess { get; init; }
+        public string ErrorMessage { get; init; } = string.Empty;
+
+        public static OnvifConfigResult Ok() => new() { IsSuccess = true };
+        public static OnvifConfigResult Fail(string msg) => new() { IsSuccess = false, ErrorMessage = msg };
+    }
+
+    /// <summary>
+    /// 封裝 ONVIF 設定寫入操作：
+    ///   - 系統時間同步 (SetSystemDateAndTime)
+    ///   - 串流參數修改 (GetVideoEncoderConfiguration + SetVideoEncoderConfiguration)
+    ///   - 使用者密碼修改 (SetUser)
+    ///   - 網路介面設定 (GetNetworkInterfaces + SetNetworkInterfaces / SetNetworkDefaultGateway)
+    /// </summary>
+    public class OnvifConfigurationService
+    {
+        private const string DeviceNs = "http://www.onvif.org/ver10/device/wsdl";
+        private const string MediaNs  = "http://www.onvif.org/ver10/media/wsdl";
+
+        // ─────────────────────────────────────────────
+        // 1. 時間同步 (SetSystemDateAndTime)
+        // ─────────────────────────────────────────────
+
+        public async Task<OnvifConfigResult> TrySetSystemDateAndTimeAsync(
+            string deviceEndpoint,
+            string username,
+            string password,
+            DateTime localTime,
+            CancellationToken cancellationToken)
+        {
+            DateTime utcTime = localTime.Kind == DateTimeKind.Utc
+                ? localTime
+                : localTime.ToUniversalTime();
+
+            string soap =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+                "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" " +
+                "xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" " +
+                "xmlns:tt=\"http://www.onvif.org/ver10/schema\">" +
+                "<s:Body>" +
+                "<tds:SetSystemDateAndTime>" +
+                "<tds:DateTimeType>Manual</tds:DateTimeType>" +
+                "<tds:DaylightSavings>false</tds:DaylightSavings>" +
+                "<tds:TimeZone>" +
+                "<tt:TZ>CST-8:00:00</tt:TZ>" +
+                "</tds:TimeZone>" +
+                "<tds:UTCDateTime>" +
+                $"<tt:Time><tt:Hour>{utcTime.Hour}</tt:Hour><tt:Minute>{utcTime.Minute}</tt:Minute><tt:Second>{utcTime.Second}</tt:Second></tt:Time>" +
+                $"<tt:Date><tt:Year>{utcTime.Year}</tt:Year><tt:Month>{utcTime.Month}</tt:Month><tt:Day>{utcTime.Day}</tt:Day></tt:Date>" +
+                "</tds:UTCDateTime>" +
+                "</tds:SetSystemDateAndTime>" +
+                "</s:Body></s:Envelope>";
+
+            string? response = await OnvifAuthenticationService.TrySendSoapRequestAsync(
+                deviceEndpoint, soap, $"{DeviceNs}/SetSystemDateAndTime",
+                username, password, cancellationToken);
+
+            if (response == null)
+                return OnvifConfigResult.Fail("無法連線或認證失敗");
+
+            if (response.Contains("Fault", StringComparison.OrdinalIgnoreCase))
+                return OnvifConfigResult.Fail(ExtractFaultMessage(response));
+
+            return OnvifConfigResult.Ok();
+        }
+
+        // ─────────────────────────────────────────────
+        // 2. 串流參數 (GetVideoEncoderConfiguration → SetVideoEncoderConfiguration)
+        // ─────────────────────────────────────────────
+
+        public async Task<OnvifConfigResult> TrySetVideoEncoderConfigAsync(
+            string mediaEndpoint,
+            string vecToken,
+            string username,
+            string password,
+            int fps,
+            int width,
+            int height,
+            CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(vecToken))
+                return OnvifConfigResult.Fail("缺少 VideoEncoderConfiguration token，請重新掃描後再試");
+
+            // 先讀取目前完整組態，保留不需要改的欄位
+            string getSoap =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+                "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\">" +
+                "<s:Body>" +
+                $"<trt:GetVideoEncoderConfiguration><trt:ConfigurationToken>{EscapeXml(vecToken)}</trt:ConfigurationToken></trt:GetVideoEncoderConfiguration>" +
+                "</s:Body></s:Envelope>";
+
+            string? getResp = await OnvifAuthenticationService.TrySendSoapRequestAsync(
+                mediaEndpoint, getSoap, $"{MediaNs}/GetVideoEncoderConfiguration",
+                username, password, cancellationToken);
+
+            if (getResp == null)
+                return OnvifConfigResult.Fail("無法讀取目前串流設定");
+
+            // 解析現有設定，取回需要保留的欄位
+            string encoding = "H264";
+            int currentBitrate = 4096;
+            int encodingInterval = 1;
+            string qualityValue = "5";
+            string configName = vecToken;
+
+            try
+            {
+                XDocument doc = XDocument.Parse(getResp);
+                XElement? cfg = doc.Descendants()
+                    .FirstOrDefault(e => string.Equals(e.Name.LocalName, "Configuration", StringComparison.OrdinalIgnoreCase));
+                if (cfg != null)
+                {
+                    encoding = GetDescendantText(cfg, "Encoding") is string enc && enc.Length > 0 ? enc : encoding;
+                    currentBitrate = int.TryParse(GetDescendantText(cfg, "BitrateLimit"), out int br) ? br : currentBitrate;
+                    encodingInterval = int.TryParse(GetDescendantText(cfg, "EncodingInterval"), out int ei) ? ei : encodingInterval;
+                    qualityValue = GetDescendantText(cfg, "Quality") is string qv && qv.Length > 0 ? qv : qualityValue;
+                    configName = GetDescendantText(cfg, "Name") is string cn && cn.Length > 0 ? cn : configName;
+                }
+            }
+            catch
+            {
+                // 繼續使用預設值
+            }
+
+            string setSoap =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+                "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" " +
+                "xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\" " +
+                "xmlns:tt=\"http://www.onvif.org/ver10/schema\">" +
+                "<s:Body>" +
+                "<trt:SetVideoEncoderConfiguration>" +
+                $"<trt:Configuration token=\"{EscapeXml(vecToken)}\">" +
+                $"<tt:Name>{EscapeXml(configName)}</tt:Name>" +
+                "<tt:UseCount>0</tt:UseCount>" +
+                $"<tt:Encoding>{EscapeXml(encoding)}</tt:Encoding>" +
+                "<tt:Resolution>" +
+                $"<tt:Width>{width}</tt:Width><tt:Height>{height}</tt:Height>" +
+                "</tt:Resolution>" +
+                $"<tt:Quality>{EscapeXml(qualityValue)}</tt:Quality>" +
+                "<tt:RateControl>" +
+                $"<tt:FrameRateLimit>{fps}</tt:FrameRateLimit>" +
+                $"<tt:EncodingInterval>{encodingInterval}</tt:EncodingInterval>" +
+                $"<tt:BitrateLimit>{currentBitrate}</tt:BitrateLimit>" +
+                "</tt:RateControl>" +
+                "</trt:Configuration>" +
+                "<trt:ForcePersistence>true</trt:ForcePersistence>" +
+                "</trt:SetVideoEncoderConfiguration>" +
+                "</s:Body></s:Envelope>";
+
+            string? setResp = await OnvifAuthenticationService.TrySendSoapRequestAsync(
+                mediaEndpoint, setSoap, $"{MediaNs}/SetVideoEncoderConfiguration",
+                username, password, cancellationToken);
+
+            if (setResp == null)
+                return OnvifConfigResult.Fail("無法連線或寫入串流設定失敗");
+
+            if (setResp.Contains("Fault", StringComparison.OrdinalIgnoreCase))
+                return OnvifConfigResult.Fail(ExtractFaultMessage(setResp));
+
+            return OnvifConfigResult.Ok();
+        }
+
+        // ─────────────────────────────────────────────
+        // 3. 使用者密碼修改 (SetUser)
+        // ─────────────────────────────────────────────
+
+        public async Task<OnvifConfigResult> TrySetUserPasswordAsync(
+            string deviceEndpoint,
+            string username,
+            string currentPassword,
+            string newPassword,
+            CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(newPassword))
+                return OnvifConfigResult.Fail("新密碼不可為空");
+
+            string soap =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+                "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" " +
+                "xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" " +
+                "xmlns:tt=\"http://www.onvif.org/ver10/schema\">" +
+                "<s:Body>" +
+                "<tds:SetUser>" +
+                "<tds:User>" +
+                $"<tt:Username>{EscapeXml(username)}</tt:Username>" +
+                $"<tt:Password>{EscapeXml(newPassword)}</tt:Password>" +
+                "<tt:UserLevel>Administrator</tt:UserLevel>" +
+                "</tds:User>" +
+                "</tds:SetUser>" +
+                "</s:Body></s:Envelope>";
+
+            string? response = await OnvifAuthenticationService.TrySendSoapRequestAsync(
+                deviceEndpoint, soap, $"{DeviceNs}/SetUser",
+                username, currentPassword, cancellationToken);
+
+            if (response == null)
+                return OnvifConfigResult.Fail("無法連線或認證失敗（請確認目前帳密正確）");
+
+            if (response.Contains("Fault", StringComparison.OrdinalIgnoreCase))
+                return OnvifConfigResult.Fail(ExtractFaultMessage(response));
+
+            return OnvifConfigResult.Ok();
+        }
+
+        // ─────────────────────────────────────────────
+        // 4. 網路設定 (GetNetworkInterfaces → SetNetworkInterfaces)
+        // ─────────────────────────────────────────────
+
+        public async Task<OnvifConfigResult> TrySetNetworkStaticIpAsync(
+            string deviceEndpoint,
+            string username,
+            string password,
+            string newIp,
+            string submask,
+            string gateway,
+            CancellationToken cancellationToken)
+        {
+            // 先取得介面 token
+            string? ifToken = await ResolveNetworkInterfaceTokenAsync(deviceEndpoint, username, password, cancellationToken);
+            if (string.IsNullOrWhiteSpace(ifToken))
+                return OnvifConfigResult.Fail("無法取得網路介面 Token，請確認此設備支援 ONVIF GetNetworkInterfaces");
+
+            int prefixLen = SubnetMaskToPrefixLength(submask);
+
+            string soap =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+                "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" " +
+                "xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" " +
+                "xmlns:tt=\"http://www.onvif.org/ver10/schema\">" +
+                "<s:Body>" +
+                "<tds:SetNetworkInterfaces>" +
+                $"<tds:InterfaceToken>{EscapeXml(ifToken)}</tds:InterfaceToken>" +
+                "<tds:NetworkInterface>" +
+                "<tt:Enabled>true</tt:Enabled>" +
+                "<tt:IPv4>" +
+                "<tt:Enabled>true</tt:Enabled>" +
+                "<tt:Manual>" +
+                $"<tt:Address>{EscapeXml(newIp)}</tt:Address>" +
+                $"<tt:PrefixLength>{prefixLen}</tt:PrefixLength>" +
+                "</tt:Manual>" +
+                "<tt:DHCP>false</tt:DHCP>" +
+                "</tt:IPv4>" +
+                "</tds:NetworkInterface>" +
+                "</tds:SetNetworkInterfaces>" +
+                "</s:Body></s:Envelope>";
+
+            string? response = await OnvifAuthenticationService.TrySendSoapRequestAsync(
+                deviceEndpoint, soap, $"{DeviceNs}/SetNetworkInterfaces",
+                username, password, cancellationToken);
+
+            if (response == null)
+                return OnvifConfigResult.Fail("無法連線或寫入網路設定失敗");
+
+            if (response.Contains("Fault", StringComparison.OrdinalIgnoreCase))
+                return OnvifConfigResult.Fail(ExtractFaultMessage(response));
+
+            // 若有閘道，設定 DefaultGateway
+            if (!string.IsNullOrWhiteSpace(gateway))
+            {
+                await TrySetDefaultGatewayAsync(deviceEndpoint, username, password, gateway, cancellationToken);
+            }
+
+            return OnvifConfigResult.Ok();
+        }
+
+        public async Task<OnvifConfigResult> TrySetNetworkDhcpAsync(
+            string deviceEndpoint,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            string? ifToken = await ResolveNetworkInterfaceTokenAsync(deviceEndpoint, username, password, cancellationToken);
+            if (string.IsNullOrWhiteSpace(ifToken))
+                return OnvifConfigResult.Fail("無法取得網路介面 Token");
+
+            string soap =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+                "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" " +
+                "xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" " +
+                "xmlns:tt=\"http://www.onvif.org/ver10/schema\">" +
+                "<s:Body>" +
+                "<tds:SetNetworkInterfaces>" +
+                $"<tds:InterfaceToken>{EscapeXml(ifToken)}</tds:InterfaceToken>" +
+                "<tds:NetworkInterface>" +
+                "<tt:Enabled>true</tt:Enabled>" +
+                "<tt:IPv4>" +
+                "<tt:Enabled>true</tt:Enabled>" +
+                "<tt:DHCP>true</tt:DHCP>" +
+                "</tt:IPv4>" +
+                "</tds:NetworkInterface>" +
+                "</tds:SetNetworkInterfaces>" +
+                "</s:Body></s:Envelope>";
+
+            string? response = await OnvifAuthenticationService.TrySendSoapRequestAsync(
+                deviceEndpoint, soap, $"{DeviceNs}/SetNetworkInterfaces",
+                username, password, cancellationToken);
+
+            if (response == null)
+                return OnvifConfigResult.Fail("無法連線或寫入 DHCP 設定失敗");
+
+            if (response.Contains("Fault", StringComparison.OrdinalIgnoreCase))
+                return OnvifConfigResult.Fail(ExtractFaultMessage(response));
+
+            return OnvifConfigResult.Ok();
+        }
+
+        // ─────────────────────────────────────────────
+        // 私有輔助方法
+        // ─────────────────────────────────────────────
+
+        private static async Task<string?> ResolveNetworkInterfaceTokenAsync(
+            string deviceEndpoint, string username, string password,
+            CancellationToken cancellationToken)
+        {
+            string soap =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+                "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">" +
+                "<s:Body><tds:GetNetworkInterfaces/></s:Body></s:Envelope>";
+
+            string? resp = await OnvifAuthenticationService.TrySendSoapRequestAsync(
+                deviceEndpoint, soap, $"{DeviceNs}/GetNetworkInterfaces",
+                username, password, cancellationToken);
+
+            if (string.IsNullOrWhiteSpace(resp))
+                return null;
+
+            try
+            {
+                XDocument doc = XDocument.Parse(resp);
+                XElement? ifElement = doc.Descendants()
+                    .FirstOrDefault(e => string.Equals(e.Name.LocalName, "NetworkInterfaces", StringComparison.OrdinalIgnoreCase));
+                return ifElement?.Attribute("token")?.Value?.Trim();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static async Task TrySetDefaultGatewayAsync(
+            string deviceEndpoint, string username, string password,
+            string gateway, CancellationToken cancellationToken)
+        {
+            string soap =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+                "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" " +
+                "xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" " +
+                "xmlns:tt=\"http://www.onvif.org/ver10/schema\">" +
+                "<s:Body>" +
+                "<tds:SetNetworkDefaultGateway>" +
+                $"<tds:IPv4Address>{EscapeXml(gateway)}</tds:IPv4Address>" +
+                "</tds:SetNetworkDefaultGateway>" +
+                "</s:Body></s:Envelope>";
+
+            await OnvifAuthenticationService.TrySendSoapRequestAsync(
+                deviceEndpoint, soap, $"{DeviceNs}/SetNetworkDefaultGateway",
+                username, password, cancellationToken);
+        }
+
+        private static string ExtractFaultMessage(string soapBody)
+        {
+            try
+            {
+                XDocument doc = XDocument.Parse(soapBody);
+                XElement? text = doc.Descendants()
+                    .FirstOrDefault(e => string.Equals(e.Name.LocalName, "Text", StringComparison.OrdinalIgnoreCase));
+                if (text != null && !string.IsNullOrWhiteSpace(text.Value))
+                    return text.Value.Trim();
+
+                XElement? fault = doc.Descendants()
+                    .FirstOrDefault(e => string.Equals(e.Name.LocalName, "Fault", StringComparison.OrdinalIgnoreCase));
+                return fault?.Value?.Trim() ?? "設備回報錯誤";
+            }
+            catch
+            {
+                return "設備回報未知錯誤";
+            }
+        }
+
+        private static string GetDescendantText(XElement element, string localName)
+        {
+            return element.Descendants()
+                .FirstOrDefault(e => string.Equals(e.Name.LocalName, localName, StringComparison.OrdinalIgnoreCase))
+                ?.Value?.Trim() ?? string.Empty;
+        }
+
+        private static string EscapeXml(string value)
+        {
+            return value
+                .Replace("&", "&amp;")
+                .Replace("<", "&lt;")
+                .Replace(">", "&gt;")
+                .Replace("\"", "&quot;")
+                .Replace("'", "&apos;");
+        }
+
+        private static int SubnetMaskToPrefixLength(string submask)
+        {
+            if (!System.Net.IPAddress.TryParse(submask, out System.Net.IPAddress? ip))
+                return 24;
+            byte[] bytes = ip.GetAddressBytes();
+            int count = 0;
+            foreach (byte b in bytes)
+            {
+                int tmp = b;
+                while (tmp != 0)
+                {
+                    count += tmp & 1;
+                    tmp >>= 1;
+                }
+            }
+            return count;
+        }
+    }
+}
+

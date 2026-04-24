@@ -1,0 +1,354 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using IPCAM_Manger.Models;
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.NamingConventions;
+
+namespace IPCAM_Manger.Services
+{
+    public class ConfigurationService
+    {
+        private readonly string _settingsDirectory;
+        private readonly string _settingsPath;
+        private readonly IDeserializer _deserializer;
+
+        public ConfigurationService()
+        {
+            string appDataDirectory = AppContext.BaseDirectory;
+
+            _settingsDirectory = appDataDirectory;
+            _settingsPath = Path.Combine(_settingsDirectory, "settings.yaml");
+            _deserializer = new DeserializerBuilder()
+                .IgnoreUnmatchedProperties()
+                .WithNamingConvention(CamelCaseNamingConvention.Instance)
+                .Build();
+        }
+
+        public string SettingsPath => _settingsPath;
+
+        public UnifiedSettings Load()
+        {
+            try
+            {
+                Directory.CreateDirectory(_settingsDirectory);
+                if (File.Exists(_settingsPath))
+                {
+                    string yaml = File.ReadAllText(_settingsPath);
+                    UnifiedSettings? settings = _deserializer.Deserialize<UnifiedSettings>(yaml);
+                    if (settings != null)
+                    {
+                        Normalize(settings);
+                        return settings;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            UnifiedSettings migrated = LoadFromLegacyJsonFiles();
+            Save(migrated);
+            return migrated;
+        }
+
+        public void Save(UnifiedSettings settings)
+        {
+            try
+            {
+                Normalize(settings);
+                Directory.CreateDirectory(_settingsDirectory);
+                CleanupOldDiagnosticFiles(settings.Diagnostics);
+                string yamlWithComments = BuildYamlWithComments(settings);
+                File.WriteAllText(_settingsPath, yamlWithComments, Encoding.UTF8);
+            }
+            catch
+            {
+                // 設定保存失敗時不得中斷主流程
+            }
+        }
+
+        private static void Normalize(UnifiedSettings settings)
+        {
+            settings.SchemaVersion = settings.SchemaVersion <= 0 ? 1 : settings.SchemaVersion;
+            settings.App ??= new AppSettingsSection();
+            settings.Dhcp ??= new DhcpSettingsSection();
+            settings.Credentials ??= [];
+            settings.DhcpLeases ??= [];
+            settings.Diagnostics ??= new DiagnosticsSettingsSection();
+            settings.App.ThemeMode = App.NormalizeThemeMode(settings.App.ThemeMode);
+            settings.App.ScanFilterLevel = settings.App.ScanFilterLevel switch
+            {
+                "寬鬆" => "寬鬆",
+                "嚴格" => "嚴格",
+                _ => "中等"
+            };
+            settings.Diagnostics.Level = NormalizeDiagnosticLevel(settings.Diagnostics.Level);
+            settings.Diagnostics.RetentionDays = Math.Clamp(settings.Diagnostics.RetentionDays, 1, 90);
+
+            settings.Credentials = settings.Credentials
+                .Select(credential => new DeviceCredential
+                {
+                    Id = string.IsNullOrWhiteSpace(credential.Id) ? Guid.NewGuid().ToString("N") : credential.Id,
+                    Username = string.IsNullOrWhiteSpace(credential.Username) ? "admin" : credential.Username.Trim(),
+                    Password = credential.Password ?? string.Empty,
+                    PriorityOuis = DeviceCredential.NormalizePriorityOuis(credential.PriorityOuis)
+                })
+                .GroupBy(credential => $"{credential.Username}\u001F{credential.Password}", StringComparer.Ordinal)
+                .Select(group => group.First())
+                .ToList();
+
+            settings.Dhcp.Adapters = settings.Dhcp.Adapters
+                .Where(adapter => !string.IsNullOrWhiteSpace(adapter.AdapterId))
+                .Select(adapter => adapter.Clone())
+                .ToList();
+
+            settings.DhcpLeases = settings.DhcpLeases
+                .Select(lease => lease.Clone())
+                .OrderByDescending(lease => lease.IsActive)
+                .ThenBy(lease => lease.IpAddress, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private UnifiedSettings LoadFromLegacyJsonFiles()
+        {
+            string legacyBaseDirectory = AppContext.BaseDirectory;
+            string appSettingsPath = Path.Combine(legacyBaseDirectory, "app-settings.json");
+            string dhcpSettingsPath = Path.Combine(legacyBaseDirectory, "dhcp-settings.json");
+            string dhcpLeasesPath = Path.Combine(legacyBaseDirectory, "dhcp-leases.json");
+            string credentialLibraryPath = Path.Combine(legacyBaseDirectory, "credential-library.json");
+
+            var settings = new UnifiedSettings();
+
+            try
+            {
+                if (File.Exists(appSettingsPath))
+                {
+                    string json = File.ReadAllText(appSettingsPath);
+                    LegacyAppSettings? appSettings = JsonSerializer.Deserialize<LegacyAppSettings>(json);
+                    if (appSettings != null)
+                    {
+                        settings.App.LastSelectedNetworkAdapterId = appSettings.LastSelectedNetworkAdapterId ?? string.Empty;
+                        settings.App.ThemeMode = appSettings.ThemeMode ?? App.ThemeSystem;
+                        settings.App.ScanFilterLevel = appSettings.ScanFilterLevel ?? "中等";
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (File.Exists(dhcpSettingsPath))
+                {
+                    string json = File.ReadAllText(dhcpSettingsPath);
+                    LegacyDhcpSettingsFile? dhcpSettings = JsonSerializer.Deserialize<LegacyDhcpSettingsFile>(json);
+                    if (dhcpSettings?.Adapters != null)
+                    {
+                        settings.Dhcp.Adapters = dhcpSettings.Adapters
+                            .Where(adapter => !string.IsNullOrWhiteSpace(adapter.AdapterId))
+                            .Select(adapter => adapter.Clone())
+                            .ToList();
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (File.Exists(credentialLibraryPath))
+                {
+                    string json = File.ReadAllText(credentialLibraryPath);
+                    List<DeviceCredential>? credentials = JsonSerializer.Deserialize<List<DeviceCredential>>(json);
+                    if (credentials != null)
+                    {
+                        settings.Credentials = credentials;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (File.Exists(dhcpLeasesPath))
+                {
+                    string json = File.ReadAllText(dhcpLeasesPath);
+                    List<DhcpLeaseRecord>? leases = JsonSerializer.Deserialize<List<DhcpLeaseRecord>>(json);
+                    if (leases != null)
+                    {
+                        settings.DhcpLeases = leases;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            Normalize(settings);
+            return settings;
+        }
+
+        private static string NormalizeDiagnosticLevel(string? level)
+        {
+            return level switch
+            {
+                "Error" => "Error",
+                "Trace" => "Trace",
+                _ => "Info"
+            };
+        }
+
+        private static string BuildYamlWithComments(UnifiedSettings settings)
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("# IPCAM_Manger 設定檔（程式自動維護）");
+            builder.AppendLine("# 說明：本檔會在程式儲存設定時重寫。若你手動加入額外註解，可能在下次儲存後被清除。\n");
+            builder.AppendLine($"schemaVersion: {settings.SchemaVersion}");
+            builder.AppendLine();
+            builder.AppendLine("app:");
+            builder.AppendLine($"  lastSelectedNetworkAdapterId: \"{EscapeYamlString(settings.App.LastSelectedNetworkAdapterId)}\"  # 上次選取網卡 GUID");
+            builder.AppendLine($"  themeMode: {settings.App.ThemeMode}  # 可接受值: System | LightClear | DarkComfort | SoftBlue | HighContrast");
+            builder.AppendLine($"  scanFilterLevel: \"{EscapeYamlString(settings.App.ScanFilterLevel)}\"  # 可接受值: 寬鬆 | 中等 | 嚴格");
+            builder.AppendLine();
+            builder.AppendLine("dhcp:");
+            builder.AppendLine("  adapters:");
+            if (settings.Dhcp.Adapters.Count == 0)
+            {
+                builder.AppendLine("    []");
+            }
+            else
+            {
+                foreach (DhcpAdapterSettings adapter in settings.Dhcp.Adapters.OrderBy(adapter => adapter.AdapterName, StringComparer.CurrentCultureIgnoreCase))
+                {
+                    builder.AppendLine($"    - adapterId: \"{EscapeYamlString(adapter.AdapterId)}\"");
+                    builder.AppendLine($"      adapterName: \"{EscapeYamlString(adapter.AdapterName)}\"");
+                    builder.AppendLine($"      isEnabled: {adapter.IsEnabled.ToString().ToLowerInvariant()}  # 啟用 DHCP 服務");
+                    builder.AppendLine($"      networkPrefix: \"{EscapeYamlString(adapter.NetworkPrefix)}\"  # 例如 192.168.50");
+                    builder.AppendLine($"      serverHostPart: {adapter.ServerHostPart}  # 1..254");
+                    builder.AppendLine($"      poolStartHost: {adapter.PoolStartHost}  # 1..254");
+                    builder.AppendLine($"      poolEndHost: {adapter.PoolEndHost}  # 1..254");
+                    builder.AppendLine($"      gateway: \"{EscapeYamlString(adapter.Gateway)}\"  # 可空白或 IPv4");
+                    builder.AppendLine($"      leaseMinutes: {adapter.LeaseMinutes}  # 最小 1");
+                }
+            }
+
+            builder.AppendLine();
+            builder.AppendLine("credentials:");
+            if (settings.Credentials.Count == 0)
+            {
+                builder.AppendLine("  []");
+            }
+            else
+            {
+                foreach (DeviceCredential credential in settings.Credentials)
+                {
+                    builder.AppendLine($"  - username: \"{EscapeYamlString(credential.Username)}\"");
+                    builder.AppendLine($"    password: \"{EscapeYamlString(credential.Password)}\"");
+                    builder.AppendLine($"    priorityOuis: \"{EscapeYamlString(credential.PriorityOuis)}\"  # 格式: AA:BB:CC, 11:22:33");
+                }
+            }
+
+            builder.AppendLine();
+            builder.AppendLine("dhcpLeases:");
+            if (settings.DhcpLeases.Count == 0)
+            {
+                builder.AppendLine("  []");
+            }
+            else
+            {
+                foreach (DhcpLeaseRecord lease in settings.DhcpLeases)
+                {
+                    builder.AppendLine($"  - adapterId: \"{EscapeYamlString(lease.AdapterId)}\"");
+                    builder.AppendLine($"    ipAddress: \"{EscapeYamlString(lease.IpAddress)}\"");
+                    builder.AppendLine($"    macAddress: \"{EscapeYamlString(lease.MacAddress)}\"");
+                    builder.AppendLine($"    hostName: \"{EscapeYamlString(lease.HostName)}\"");
+                    builder.AppendLine($"    firstSeenAt: \"{lease.FirstSeenAt:O}\"");
+                    builder.AppendLine($"    lastSeenAt: \"{lease.LastSeenAt:O}\"");
+                    builder.AppendLine($"    leaseExpiresAt: \"{lease.LeaseExpiresAt:O}\"");
+                    builder.AppendLine($"    isActive: {lease.IsActive.ToString().ToLowerInvariant()}");
+                }
+            }
+
+            builder.AppendLine();
+            builder.AppendLine("diagnostics:");
+            builder.AppendLine($"  enabled: {settings.Diagnostics.Enabled.ToString().ToLowerInvariant()}  # true=開啟掃描診斷");
+            builder.AppendLine($"  level: {settings.Diagnostics.Level}  # 可接受值: Error | Info | Trace");
+            builder.AppendLine($"  outputDir: \"{EscapeYamlString(settings.Diagnostics.OutputDir)}\"  # 空白=使用執行目錄/logs");
+            builder.AppendLine($"  retentionDays: {settings.Diagnostics.RetentionDays}  # 1..90");
+            builder.AppendLine($"  includePerCameraResponse: {settings.Diagnostics.IncludePerCameraResponse.ToString().ToLowerInvariant()}  # 每台攝影機回覆摘要");
+            builder.AppendLine($"  maskSensitiveFields: {settings.Diagnostics.MaskSensitiveFields.ToString().ToLowerInvariant()}  # true=遮罩帳密");
+
+            return builder.ToString();
+        }
+
+        private static string EscapeYamlString(string? value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return string.Empty;
+            }
+
+            return value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        private static void CleanupOldDiagnosticFiles(DiagnosticsSettingsSection diagnostics)
+        {
+            if (!diagnostics.Enabled || diagnostics.RetentionDays <= 0)
+            {
+                return;
+            }
+
+            try
+            {
+                string logsDirectory = ResolveLogsDirectory(diagnostics);
+                if (!Directory.Exists(logsDirectory))
+                {
+                    return;
+                }
+
+                DateTime cutoff = DateTime.Now.Date.AddDays(-diagnostics.RetentionDays);
+                foreach (string filePath in Directory.EnumerateFiles(logsDirectory, "scan-diagnostics-*.jsonl"))
+                {
+                    DateTime lastWrite = File.GetLastWriteTime(filePath);
+                    if (lastWrite < cutoff)
+                    {
+                        File.Delete(filePath);
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static string ResolveLogsDirectory(DiagnosticsSettingsSection diagnostics)
+        {
+            if (!string.IsNullOrWhiteSpace(diagnostics.OutputDir))
+            {
+                return diagnostics.OutputDir;
+            }
+
+            return Path.Combine(AppContext.BaseDirectory, "logs");
+        }
+
+        private sealed class LegacyAppSettings
+        {
+            public string? LastSelectedNetworkAdapterId { get; set; }
+            public string? ThemeMode { get; set; }
+            public string? ScanFilterLevel { get; set; }
+        }
+
+        private sealed class LegacyDhcpSettingsFile
+        {
+            public List<DhcpAdapterSettings>? Adapters { get; set; }
+        }
+    }
+}

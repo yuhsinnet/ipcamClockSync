@@ -1,0 +1,305 @@
+using System.Buffers.Binary;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace IPCAM_Manger.Services
+{
+    internal enum DhcpMessageType : byte
+    {
+        Discover = 1,
+        Offer = 2,
+        Request = 3,
+        Decline = 4,
+        Ack = 5,
+        Nak = 6,
+        Release = 7,
+        Inform = 8
+    }
+
+    internal sealed class DhcpPacketInfo
+    {
+        public DhcpMessageType MessageType { get; init; }
+
+        public uint TransactionId { get; init; }
+
+        public byte[] ClientHardwareAddress { get; init; } = [];
+
+        public string ClientMacAddress { get; init; } = string.Empty;
+
+        public IPAddress? RequestedIpAddress { get; init; }
+
+        public IPAddress? ClientIpAddress { get; init; }
+
+        public IPAddress? YourIpAddress { get; init; }
+
+        public IPAddress? ServerIdentifier { get; init; }
+
+        public string HostName { get; init; } = string.Empty;
+    }
+
+    internal static class DhcpProtocolHelper
+    {
+        private static readonly byte[] MagicCookie = [99, 130, 83, 99];
+        private static readonly IPAddress ZeroAddress = IPAddress.Parse("0.0.0.0");
+
+        public static uint CreateTransactionId()
+        {
+            Span<byte> bytes = stackalloc byte[4];
+            RandomNumberGenerator.Fill(bytes);
+            return BinaryPrimitives.ReadUInt32BigEndian(bytes);
+        }
+
+        public static byte[] BuildDiscoverPacket(byte[] macAddress, uint transactionId)
+        {
+            var options = new List<byte>
+            {
+                53, 1, (byte)DhcpMessageType.Discover,
+                61, (byte)(macAddress.Length + 1), 1
+            };
+
+            options.AddRange(macAddress);
+            options.AddRange([55, 5, 1, 3, 6, 51, 54]);
+
+            string hostName = Environment.MachineName;
+            if (!string.IsNullOrWhiteSpace(hostName))
+            {
+                byte[] hostNameBytes = Encoding.ASCII.GetBytes(hostName.Length > 32 ? hostName[..32] : hostName);
+                options.Add(12);
+                options.Add((byte)hostNameBytes.Length);
+                options.AddRange(hostNameBytes);
+            }
+
+            options.Add(255);
+            return BuildBootpPacket(transactionId, macAddress, DhcpMessageType.Discover, ZeroAddress, ZeroAddress, ZeroAddress, options);
+        }
+
+        public static byte[] BuildResponsePacket(
+            DhcpMessageType messageType,
+            DhcpPacketInfo request,
+            IPAddress yourIpAddress,
+            IPAddress serverIdentifier,
+            IPAddress subnetMask,
+            IPAddress? gateway,
+            TimeSpan leaseTime)
+        {
+            var options = new List<byte>
+            {
+                53, 1, (byte)messageType,
+                54, 4
+            };
+
+            options.AddRange(serverIdentifier.GetAddressBytes());
+
+            if (messageType != DhcpMessageType.Nak)
+            {
+                options.AddRange([51, 4]);
+                options.AddRange(GetLeaseBytes((uint)Math.Max(60, leaseTime.TotalSeconds)));
+
+                options.AddRange([1, 4]);
+                options.AddRange(subnetMask.GetAddressBytes());
+
+                if (gateway != null && !gateway.Equals(ZeroAddress) && !string.IsNullOrWhiteSpace(gateway.ToString()))
+                {
+                    options.AddRange([3, 4]);
+                    options.AddRange(gateway.GetAddressBytes());
+                }
+
+                uint renewalSeconds = (uint)Math.Max(30, leaseTime.TotalSeconds / 2);
+                uint rebindingSeconds = (uint)Math.Max(45, leaseTime.TotalSeconds * 7 / 8);
+
+                options.AddRange([58, 4]);
+                options.AddRange(GetLeaseBytes(renewalSeconds));
+                options.AddRange([59, 4]);
+                options.AddRange(GetLeaseBytes(rebindingSeconds));
+            }
+
+            options.Add(255);
+            return BuildBootpPacket(
+                request.TransactionId,
+                request.ClientHardwareAddress,
+                messageType,
+                request.ClientIpAddress ?? ZeroAddress,
+                yourIpAddress,
+                serverIdentifier,
+                options,
+                reply: true);
+        }
+
+        public static bool TryParsePacket(ReadOnlySpan<byte> payload, out DhcpPacketInfo packet)
+        {
+            packet = new DhcpPacketInfo();
+
+            if (payload.Length < 240)
+            {
+                return false;
+            }
+
+            if (!payload.Slice(236, 4).SequenceEqual(MagicCookie))
+            {
+                return false;
+            }
+
+            int hardwareLength = payload[2];
+            if (hardwareLength <= 0 || hardwareLength > 16)
+            {
+                return false;
+            }
+
+            uint transactionId = BinaryPrimitives.ReadUInt32BigEndian(payload.Slice(4, 4));
+            byte[] macAddress = payload.Slice(28, hardwareLength).ToArray();
+            DhcpMessageType? messageType = null;
+            IPAddress? requestedIpAddress = null;
+            IPAddress? serverIdentifier = null;
+            string hostName = string.Empty;
+
+            int index = 240;
+            while (index < payload.Length)
+            {
+                byte optionType = payload[index++];
+                if (optionType == 255)
+                {
+                    break;
+                }
+
+                if (optionType == 0)
+                {
+                    continue;
+                }
+
+                if (index >= payload.Length)
+                {
+                    return false;
+                }
+
+                int optionLength = payload[index++];
+                if (index + optionLength > payload.Length)
+                {
+                    return false;
+                }
+
+                ReadOnlySpan<byte> optionValue = payload.Slice(index, optionLength);
+                index += optionLength;
+
+                switch (optionType)
+                {
+                    case 53 when optionLength >= 1:
+                        messageType = (DhcpMessageType)optionValue[0];
+                        break;
+                    case 50 when optionLength == 4:
+                        requestedIpAddress = new IPAddress(optionValue);
+                        break;
+                    case 54 when optionLength == 4:
+                        serverIdentifier = new IPAddress(optionValue);
+                        break;
+                    case 12 when optionLength > 0:
+                        hostName = Encoding.ASCII.GetString(optionValue);
+                        break;
+                }
+            }
+
+            if (!messageType.HasValue)
+            {
+                return false;
+            }
+
+            packet = new DhcpPacketInfo
+            {
+                MessageType = messageType.Value,
+                TransactionId = transactionId,
+                ClientHardwareAddress = macAddress,
+                ClientMacAddress = FormatMacAddress(macAddress),
+                RequestedIpAddress = requestedIpAddress,
+                ClientIpAddress = ReadAddress(payload.Slice(12, 4)),
+                YourIpAddress = ReadAddress(payload.Slice(16, 4)),
+                ServerIdentifier = serverIdentifier,
+                HostName = hostName.Trim()
+            };
+
+            return true;
+        }
+
+        public static bool TryParseMacAddress(string macText, out byte[] macAddress)
+        {
+            macAddress = [];
+            if (string.IsNullOrWhiteSpace(macText))
+            {
+                return false;
+            }
+
+            string compact = macText.Replace("-", string.Empty, StringComparison.Ordinal)
+                .Replace(":", string.Empty, StringComparison.Ordinal)
+                .Trim();
+
+            if (compact.Length != 12)
+            {
+                return false;
+            }
+
+            var result = new byte[6];
+            for (int index = 0; index < result.Length; index++)
+            {
+                if (!byte.TryParse(compact.AsSpan(index * 2, 2), System.Globalization.NumberStyles.HexNumber, null, out result[index]))
+                {
+                    return false;
+                }
+            }
+
+            macAddress = result;
+            return true;
+        }
+
+        public static string FormatMacAddress(byte[] macAddress)
+        {
+            return macAddress.Length == 0
+                ? string.Empty
+                : string.Join("-", macAddress.Select(value => value.ToString("X2")));
+        }
+
+        private static byte[] BuildBootpPacket(
+            uint transactionId,
+            byte[] macAddress,
+            DhcpMessageType messageType,
+            IPAddress clientIpAddress,
+            IPAddress yourIpAddress,
+            IPAddress serverIpAddress,
+            List<byte> options,
+            bool reply = false)
+        {
+            byte[] packet = new byte[240 + options.Count];
+            packet[0] = reply ? (byte)2 : (byte)1;
+            packet[1] = 1;
+            packet[2] = (byte)macAddress.Length;
+            packet[3] = 0;
+            BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(4, 4), transactionId);
+            packet[10] = 0x80;
+
+            clientIpAddress.GetAddressBytes().CopyTo(packet, 12);
+            yourIpAddress.GetAddressBytes().CopyTo(packet, 16);
+            serverIpAddress.GetAddressBytes().CopyTo(packet, 20);
+            Array.Copy(macAddress, 0, packet, 28, Math.Min(macAddress.Length, 16));
+            Array.Copy(MagicCookie, 0, packet, 236, MagicCookie.Length);
+
+            options.CopyTo(packet, 240);
+            return packet;
+        }
+
+        private static IPAddress? ReadAddress(ReadOnlySpan<byte> bytes)
+        {
+            return bytes.Length == 4
+                && bytes[0] == 0
+                && bytes[1] == 0
+                && bytes[2] == 0
+                && bytes[3] == 0
+                ? null
+                : new IPAddress(bytes);
+        }
+
+        private static byte[] GetLeaseBytes(uint seconds)
+        {
+            byte[] bytes = new byte[4];
+            BinaryPrimitives.WriteUInt32BigEndian(bytes, seconds);
+            return bytes;
+        }
+    }
+}

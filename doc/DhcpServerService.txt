@@ -1,0 +1,407 @@
+using System.Net;
+using System.Net.Sockets;
+using IPCAM_Manger.Models;
+
+namespace IPCAM_Manger.Services
+{
+    public sealed class DhcpLeasesChangedEventArgs : EventArgs
+    {
+        public DhcpLeasesChangedEventArgs(IReadOnlyList<DhcpLeaseRecord> leases)
+        {
+            Leases = leases;
+        }
+
+        public IReadOnlyList<DhcpLeaseRecord> Leases { get; }
+    }
+
+    public class DhcpServerService : IDisposable
+    {
+        private readonly object _syncRoot = new();
+        private readonly Dictionary<string, DhcpLeaseRecord> _leasesByMac = new(StringComparer.OrdinalIgnoreCase);
+        private Socket? _socket;
+        private CancellationTokenSource? _cancellationTokenSource;
+        private Task? _listenerTask;
+        private DhcpAdapterSettings? _settings;
+
+        public event EventHandler<DhcpLeasesChangedEventArgs>? LeasesChanged;
+
+        public bool IsRunning { get; private set; }
+
+        public Task StartAsync(DhcpAdapterSettings settings, IReadOnlyCollection<DhcpLeaseRecord> existingLeases)
+        {
+            if (settings == null)
+            {
+                throw new ArgumentNullException(nameof(settings));
+            }
+
+            if (IsRunning)
+            {
+                throw new InvalidOperationException("DHCP 服務已在執行中。");
+            }
+
+            if (!settings.TryGetServerIpAddress(out IPAddress? serverIpAddress) || serverIpAddress == null)
+            {
+                throw new InvalidOperationException("DHCP 服務 IP 位址無效。");
+            }
+
+            _settings = settings.Clone();
+            _leasesByMac.Clear();
+
+            foreach (DhcpLeaseRecord lease in existingLeases
+                .Where(lease => string.Equals(lease.AdapterId, settings.AdapterId, StringComparison.OrdinalIgnoreCase)))
+            {
+                _leasesByMac[lease.MacAddress] = lease.Clone();
+            }
+
+            _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp)
+            {
+                EnableBroadcast = true,
+                ExclusiveAddressUse = false
+            };
+            _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            _socket.Bind(new IPEndPoint(IPAddress.Any, 67));
+
+            _cancellationTokenSource = new CancellationTokenSource();
+            _listenerTask = Task.Run(() => ListenLoopAsync(serverIpAddress, _cancellationTokenSource.Token));
+            IsRunning = true;
+
+            RaiseLeasesChanged();
+            return Task.CompletedTask;
+        }
+
+        public async Task StopAsync()
+        {
+            if (!IsRunning)
+            {
+                return;
+            }
+
+            try
+            {
+                _cancellationTokenSource?.Cancel();
+                _socket?.Close();
+
+                if (_listenerTask != null)
+                {
+                    await _listenerTask.ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                _socket?.Dispose();
+                _socket = null;
+                _cancellationTokenSource?.Dispose();
+                _cancellationTokenSource = null;
+                _listenerTask = null;
+                IsRunning = false;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (IsRunning)
+            {
+                StopAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+            }
+
+            _socket?.Dispose();
+            _socket = null;
+            _cancellationTokenSource?.Dispose();
+            _cancellationTokenSource = null;
+            _listenerTask = null;
+        }
+
+        private async Task ListenLoopAsync(IPAddress serverIpAddress, CancellationToken cancellationToken)
+        {
+            if (_socket == null || _settings == null)
+            {
+                return;
+            }
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    byte[] buffer = new byte[1500];
+                    EndPoint remoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
+                    SocketReceiveFromResult result = await _socket.ReceiveFromAsync(buffer, SocketFlags.None, remoteEndPoint, cancellationToken);
+
+                    if (!DhcpProtocolHelper.TryParsePacket(buffer.AsSpan(0, result.ReceivedBytes), out DhcpPacketInfo packet))
+                    {
+                        continue;
+                    }
+
+                    if (packet.MessageType is not DhcpMessageType.Discover and not DhcpMessageType.Request)
+                    {
+                        continue;
+                    }
+
+                    if (!IsRequestRelevant(packet, serverIpAddress))
+                    {
+                        continue;
+                    }
+
+                    if (packet.MessageType == DhcpMessageType.Discover)
+                    {
+                        await HandleDiscoverAsync(packet, serverIpAddress, cancellationToken);
+                    }
+                    else
+                    {
+                        await HandleRequestAsync(packet, serverIpAddress, cancellationToken);
+                    }
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private async Task HandleDiscoverAsync(DhcpPacketInfo packet, IPAddress serverIpAddress, CancellationToken cancellationToken)
+        {
+            if (_socket == null || _settings == null)
+            {
+                return;
+            }
+
+            IPAddress? offeredAddress = SelectLeaseAddress(packet, allowCreate: true);
+            if (offeredAddress == null)
+            {
+                return;
+            }
+
+            byte[] response = DhcpProtocolHelper.BuildResponsePacket(
+                DhcpMessageType.Offer,
+                packet,
+                offeredAddress,
+                serverIpAddress,
+                IPAddress.Parse("255.255.255.0"),
+                ResolveGateway(),
+                TimeSpan.FromMinutes(_settings.LeaseMinutes));
+
+            await _socket.SendToAsync(response, SocketFlags.None, new IPEndPoint(IPAddress.Broadcast, 68), cancellationToken);
+        }
+
+        private async Task HandleRequestAsync(DhcpPacketInfo packet, IPAddress serverIpAddress, CancellationToken cancellationToken)
+        {
+            if (_socket == null || _settings == null)
+            {
+                return;
+            }
+
+            IPAddress? grantedAddress = SelectLeaseAddress(packet, allowCreate: true);
+            if (grantedAddress == null)
+            {
+                byte[] nakResponse = DhcpProtocolHelper.BuildResponsePacket(
+                    DhcpMessageType.Nak,
+                    packet,
+                    IPAddress.Parse("0.0.0.0"),
+                    serverIpAddress,
+                    IPAddress.Parse("255.255.255.0"),
+                    null,
+                    TimeSpan.Zero);
+
+                await _socket.SendToAsync(nakResponse, SocketFlags.None, new IPEndPoint(IPAddress.Broadcast, 68), cancellationToken);
+                return;
+            }
+
+            UpdateLease(packet, grantedAddress);
+
+            byte[] ackResponse = DhcpProtocolHelper.BuildResponsePacket(
+                DhcpMessageType.Ack,
+                packet,
+                grantedAddress,
+                serverIpAddress,
+                IPAddress.Parse("255.255.255.0"),
+                ResolveGateway(),
+                TimeSpan.FromMinutes(_settings.LeaseMinutes));
+
+            await _socket.SendToAsync(ackResponse, SocketFlags.None, new IPEndPoint(IPAddress.Broadcast, 68), cancellationToken);
+            RaiseLeasesChanged();
+        }
+
+        private bool IsRequestRelevant(DhcpPacketInfo packet, IPAddress serverIpAddress)
+        {
+            if (_settings == null)
+            {
+                return false;
+            }
+
+            if (packet.ServerIdentifier != null && !packet.ServerIdentifier.Equals(serverIpAddress))
+            {
+                return false;
+            }
+
+            if (packet.RequestedIpAddress != null)
+            {
+                return packet.RequestedIpAddress.ToString().StartsWith(_settings.NetworkPrefix + ".", StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (packet.ClientIpAddress != null)
+            {
+                return packet.ClientIpAddress.ToString().StartsWith(_settings.NetworkPrefix + ".", StringComparison.OrdinalIgnoreCase);
+            }
+
+            return true;
+        }
+
+        private IPAddress? SelectLeaseAddress(DhcpPacketInfo packet, bool allowCreate)
+        {
+            if (_settings == null)
+            {
+                return null;
+            }
+
+            DateTime now = DateTime.Now;
+            ExpireLeases(now);
+
+            lock (_syncRoot)
+            {
+                if (_leasesByMac.TryGetValue(packet.ClientMacAddress, out DhcpLeaseRecord? existingLease)
+                    && IPAddress.TryParse(existingLease.IpAddress, out IPAddress? existingAddress)
+                    && IsAddressInPool(existingAddress)
+                    && IsAddressAvailable(existingAddress, packet.ClientMacAddress, now))
+                {
+                    return existingAddress;
+                }
+
+                if (packet.RequestedIpAddress != null
+                    && IsAddressInPool(packet.RequestedIpAddress)
+                    && IsAddressAvailable(packet.RequestedIpAddress, packet.ClientMacAddress, now))
+                {
+                    return packet.RequestedIpAddress;
+                }
+
+                if (!allowCreate)
+                {
+                    return null;
+                }
+
+                for (int hostPart = _settings.PoolStartHost; hostPart <= _settings.PoolEndHost; hostPart++)
+                {
+                    IPAddress candidate = IPAddress.Parse($"{_settings.NetworkPrefix}.{hostPart}");
+                    if (IsAddressAvailable(candidate, packet.ClientMacAddress, now))
+                    {
+                        return candidate;
+                    }
+                }
+
+                return null;
+            }
+        }
+
+        private void UpdateLease(DhcpPacketInfo packet, IPAddress grantedAddress)
+        {
+            if (_settings == null)
+            {
+                return;
+            }
+
+            lock (_syncRoot)
+            {
+                DateTime now = DateTime.Now;
+                if (!_leasesByMac.TryGetValue(packet.ClientMacAddress, out DhcpLeaseRecord? lease))
+                {
+                    lease = new DhcpLeaseRecord
+                    {
+                        AdapterId = _settings.AdapterId,
+                        MacAddress = packet.ClientMacAddress,
+                        FirstSeenAt = now
+                    };
+                }
+
+                lease.AdapterId = _settings.AdapterId;
+                lease.IpAddress = grantedAddress.ToString();
+                lease.HostName = string.IsNullOrWhiteSpace(packet.HostName) ? lease.HostName : packet.HostName;
+                lease.LastSeenAt = now;
+                lease.LeaseExpiresAt = now.AddMinutes(_settings.LeaseMinutes);
+                lease.IsActive = true;
+
+                _leasesByMac[packet.ClientMacAddress] = lease;
+            }
+        }
+
+        private void ExpireLeases(DateTime now)
+        {
+            lock (_syncRoot)
+            {
+                foreach (DhcpLeaseRecord lease in _leasesByMac.Values)
+                {
+                    if (lease.LeaseExpiresAt != default && lease.LeaseExpiresAt < now)
+                    {
+                        lease.IsActive = false;
+                    }
+                }
+            }
+        }
+
+        private bool IsAddressInPool(IPAddress address)
+        {
+            if (_settings == null)
+            {
+                return false;
+            }
+
+            string text = address.ToString();
+            if (!text.StartsWith(_settings.NetworkPrefix + ".", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            int hostPart = int.Parse(text.Split('.')[3]);
+            return hostPart >= _settings.PoolStartHost && hostPart <= _settings.PoolEndHost;
+        }
+
+        private bool IsAddressAvailable(IPAddress address, string requestingMacAddress, DateTime now)
+        {
+            lock (_syncRoot)
+            {
+                return _leasesByMac.Values.All(lease =>
+                {
+                    if (string.Equals(lease.MacAddress, requestingMacAddress, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+
+                    if (!string.Equals(lease.IpAddress, address.ToString(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+
+                    return !lease.IsActive || (lease.LeaseExpiresAt != default && lease.LeaseExpiresAt < now);
+                });
+            }
+        }
+
+        private IPAddress? ResolveGateway()
+        {
+            return _settings != null && IPAddress.TryParse(_settings.Gateway, out IPAddress? gateway)
+                ? gateway
+                : null;
+        }
+
+        private void RaiseLeasesChanged()
+        {
+            IReadOnlyList<DhcpLeaseRecord> snapshot;
+            lock (_syncRoot)
+            {
+                snapshot = _leasesByMac.Values
+                    .Select(lease => lease.Clone())
+                    .OrderBy(lease => lease.IpAddress, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+            }
+
+            LeasesChanged?.Invoke(this, new DhcpLeasesChangedEventArgs(snapshot));
+        }
+    }
+}

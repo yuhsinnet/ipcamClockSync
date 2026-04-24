@@ -1,0 +1,69 @@
+using System;
+using System.IO;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using IPCAM_Manger.Models;
+
+namespace IPCAM_Manger.Services
+{
+    public class CameraScanDiagnosticsWriter
+    {
+        private static readonly SemaphoreSlim WriteLock = new(1, 1);
+        private readonly DiagnosticsSettingsSection _settings;
+
+        public CameraScanDiagnosticsWriter(DiagnosticsSettingsSection settings)
+        {
+            _settings = settings ?? new DiagnosticsSettingsSection();
+        }
+
+        public bool IsEnabled => _settings.Enabled;
+
+        public async Task WriteAsync(string eventName, object payload)
+        {
+            if (!IsEnabled)
+            {
+                return;
+            }
+
+            try
+            {
+                string logsDirectory = ResolveLogsDirectory();
+                Directory.CreateDirectory(logsDirectory);
+                string logFilePath = Path.Combine(logsDirectory, $"scan-diagnostics-{DateTime.Now:yyyyMMdd}.jsonl");
+
+                string line = JsonSerializer.Serialize(new
+                {
+                    timestamp = DateTimeOffset.Now,
+                    level = _settings.Level,
+                    eventName,
+                    payload
+                });
+
+                await WriteLock.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    await File.AppendAllTextAsync(logFilePath, line + Environment.NewLine).ConfigureAwait(false);
+                }
+                finally
+                {
+                    WriteLock.Release();
+                }
+            }
+            catch
+            {
+                // 診斷輸出失敗不影響主流程
+            }
+        }
+
+        private string ResolveLogsDirectory()
+        {
+            if (!string.IsNullOrWhiteSpace(_settings.OutputDir))
+            {
+                return _settings.OutputDir;
+            }
+
+            return Path.Combine(AppContext.BaseDirectory, "logs");
+        }
+    }
+}

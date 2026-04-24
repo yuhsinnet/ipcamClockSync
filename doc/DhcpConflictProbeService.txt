@@ -1,0 +1,135 @@
+using System.Net;
+using System.Net.Sockets;
+using IPCAM_Manger.Models;
+
+namespace IPCAM_Manger.Services
+{
+    public class DhcpConflictProbeService
+    {
+        public async Task<DhcpProbeResult> ProbeAsync(NetworkAdapterInfo adapter, CancellationToken cancellationToken)
+        {
+            if (adapter == null)
+            {
+                throw new ArgumentNullException(nameof(adapter));
+            }
+
+            if (!IPAddress.TryParse(adapter.PrimaryIpAddress, out IPAddress? localIpAddress)
+                || localIpAddress.AddressFamily != AddressFamily.InterNetwork)
+            {
+                return new DhcpProbeResult
+                {
+                    State = DhcpConflictState.Unknown,
+                    Summary = "無法確認是否已有其他 DHCP 伺服器",
+                    Detail = "所選網卡沒有可用的 IPv4 位址，無法送出 DHCP 探測。"
+                };
+            }
+
+            if (!DhcpProtocolHelper.TryParseMacAddress(adapter.MacAddress, out byte[] macAddress))
+            {
+                return new DhcpProbeResult
+                {
+                    State = DhcpConflictState.Unknown,
+                    Summary = "無法確認是否已有其他 DHCP 伺服器",
+                    Detail = "所選網卡的 MAC 位址格式無法解析。"
+                };
+            }
+
+            try
+            {
+                using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp)
+                {
+                    EnableBroadcast = true,
+                    ExclusiveAddressUse = false,
+                    ReceiveTimeout = 250
+                };
+
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                socket.Bind(new IPEndPoint(localIpAddress, 68));
+
+                uint transactionId = DhcpProtocolHelper.CreateTransactionId();
+                byte[] discoverPacket = DhcpProtocolHelper.BuildDiscoverPacket(macAddress, transactionId);
+                await socket.SendToAsync(discoverPacket, SocketFlags.None, new IPEndPoint(IPAddress.Broadcast, 67), cancellationToken);
+
+                DateTime deadline = DateTime.UtcNow.AddMilliseconds(1200);
+                var detectedServers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                while (DateTime.UtcNow < deadline)
+                {
+                    byte[] buffer = new byte[1500];
+                    EndPoint remoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
+
+                    using var receiveTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    receiveTimeout.CancelAfter(220);
+
+                    try
+                    {
+                        SocketReceiveFromResult response = await socket.ReceiveFromAsync(buffer, SocketFlags.None, remoteEndPoint, receiveTimeout.Token);
+                        if (!DhcpProtocolHelper.TryParsePacket(buffer.AsSpan(0, response.ReceivedBytes), out DhcpPacketInfo packet))
+                        {
+                            continue;
+                        }
+
+                        if (packet.TransactionId != transactionId)
+                        {
+                            continue;
+                        }
+
+                        if (packet.MessageType is not DhcpMessageType.Offer and not DhcpMessageType.Ack)
+                        {
+                            continue;
+                        }
+
+                        string serverAddress = packet.ServerIdentifier?.ToString()
+                            ?? ((IPEndPoint)response.RemoteEndPoint).Address.ToString();
+
+                        if (!string.IsNullOrWhiteSpace(serverAddress))
+                        {
+                            detectedServers.Add(serverAddress);
+                        }
+                    }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        continue;
+                    }
+                }
+
+                if (detectedServers.Count > 0)
+                {
+                    string joinedServers = string.Join("、", detectedServers);
+                    return new DhcpProbeResult
+                    {
+                        State = DhcpConflictState.Conflict,
+                        Summary = "偵測到其他 DHCP 伺服器",
+                        Detail = $"在網卡 {adapter.Name} 的網段中收到 DHCP 回應：{joinedServers}",
+                        DetectedServerAddresses = detectedServers.OrderBy(address => address, StringComparer.OrdinalIgnoreCase).ToList()
+                    };
+                }
+
+                return new DhcpProbeResult
+                {
+                    State = DhcpConflictState.Clear,
+                    Summary = "目前未偵測到其他 DHCP 伺服器",
+                    Detail = $"已在網卡 {adapter.Name} 上完成 DHCP 探測，未收到其他伺服器回應。"
+                };
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
+            {
+                return new DhcpProbeResult
+                {
+                    State = DhcpConflictState.Unknown,
+                    Summary = "無法確認是否已有其他 DHCP 伺服器",
+                    Detail = "DHCP 探測需要綁定本機 68 埠，但該埠目前已被其他服務占用。"
+                };
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return new DhcpProbeResult
+                {
+                    State = DhcpConflictState.Unknown,
+                    Summary = "無法確認是否已有其他 DHCP 伺服器",
+                    Detail = $"DHCP 探測失敗：{ex.Message}"
+                };
+            }
+        }
+    }
+}

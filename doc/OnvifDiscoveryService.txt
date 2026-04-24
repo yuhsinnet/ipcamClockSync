@@ -1,0 +1,363 @@
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Xml.Linq;
+
+namespace IPCAM_Manger.Services
+{
+    public class OnvifDiscoveryDevice
+    {
+        public string IpAddress { get; init; } = string.Empty;
+        public string? XAddress { get; init; }
+        public string[] DiscoveryTypes { get; init; } = Array.Empty<string>();
+        public string[] DiscoveryScopes { get; init; } = Array.Empty<string>();
+        public bool HasOnvifXAddress { get; init; }
+        public bool HasOnvifTypeSignal { get; init; }
+        public bool HasCameraLikeScopeSignal { get; init; }
+        public bool IsFallbackFromRemoteEndpoint { get; init; }
+    }
+
+    public class OnvifDiscoveryService
+    {
+        private static readonly IPEndPoint DiscoveryEndpoint = new(IPAddress.Parse("239.255.255.250"), 3702);
+        private static readonly IPEndPoint DiscoveryBroadcastEndpoint = new(IPAddress.Broadcast, 3702);
+        private static readonly IPAddress DiscoveryMulticastAddress = IPAddress.Parse("239.255.255.250");
+        private const int DiscoveryPort = 3702;
+        private const int BroadcastProbeRepeatCount = 5;
+        private static readonly TimeSpan DiscoveryProbeRetryInterval = TimeSpan.FromMilliseconds(120);
+
+        public async Task<IReadOnlyList<OnvifDiscoveryDevice>> DiscoverAsync(
+            IPAddress localAddress,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            return await DiscoverAsync(localAddress, timeout, onDeviceDiscovered: null, cancellationToken);
+        }
+
+        public async Task<IReadOnlyList<OnvifDiscoveryDevice>> DiscoverAsync(
+            IPAddress localAddress,
+            TimeSpan timeout,
+            Action<OnvifDiscoveryDevice>? onDeviceDiscovered,
+            CancellationToken cancellationToken)
+        {
+            var discoveredByIp = new Dictionary<string, OnvifDiscoveryDevice>(StringComparer.OrdinalIgnoreCase);
+            using UdpClient udpClient = CreateDiscoveryClient(localAddress);
+
+            foreach ((byte[] payload, IPEndPoint endpoint) in BuildProbeSequence())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await udpClient.SendAsync(payload, payload.Length, endpoint);
+                await Task.Delay(DiscoveryProbeRetryInterval, cancellationToken);
+            }
+
+            DateTime expireAt = DateTime.UtcNow + timeout;
+            while (DateTime.UtcNow < expireAt)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                TimeSpan remaining = expireAt - DateTime.UtcNow;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    break;
+                }
+
+                using var receiveTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                receiveTimeoutCts.CancelAfter(remaining);
+
+                try
+                {
+                    UdpReceiveResult receiveResult = await udpClient.ReceiveAsync(receiveTimeoutCts.Token);
+
+                    if (receiveResult.RemoteEndPoint.Address.Equals(localAddress))
+                    {
+                        continue;
+                    }
+
+                    string payload = Encoding.UTF8.GetString(receiveResult.Buffer);
+
+                    foreach (OnvifDiscoveryDevice device in ParseDiscoveryResponse(payload, receiveResult.RemoteEndPoint.Address))
+                    {
+                        if (discoveredByIp.TryGetValue(device.IpAddress, out OnvifDiscoveryDevice? existingDevice))
+                        {
+                            discoveredByIp[device.IpAddress] = MergeDiscoveryDevice(existingDevice, device);
+                        }
+                        else
+                        {
+                            discoveredByIp[device.IpAddress] = device;
+                            try
+                            {
+                                onDeviceDiscovered?.Invoke(device);
+                            }
+                            catch
+                            {
+                                // callback 例外不影響 discovery 主流程
+                            }
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+
+                    break;
+                }
+                catch
+                {
+                    // 單筆回應解析失敗時略過，繼續收其他回應
+                }
+            }
+
+            return discoveredByIp.Values
+                .OrderBy(device => ToSortableIpv4Value(device.IpAddress))
+                .ToList();
+        }
+
+        private static UdpClient CreateDiscoveryClient(IPAddress localAddress)
+        {
+            UdpClient? discoveryClient = null;
+
+            try
+            {
+                discoveryClient = new UdpClient(AddressFamily.InterNetwork);
+                ConfigureSocket(discoveryClient.Client, localAddress);
+
+                try
+                {
+                    discoveryClient.Client.Bind(new IPEndPoint(localAddress, DiscoveryPort));
+                }
+                catch (SocketException)
+                {
+                    discoveryClient.Client.Bind(new IPEndPoint(localAddress, 0));
+                }
+
+                discoveryClient.JoinMulticastGroup(DiscoveryMulticastAddress, localAddress);
+                return discoveryClient;
+            }
+            catch
+            {
+                discoveryClient?.Dispose();
+                throw;
+            }
+        }
+
+        private static void ConfigureSocket(Socket socket, IPAddress localAddress)
+        {
+            socket.ExclusiveAddressUse = false;
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Broadcast, true);
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 1024 * 1024);
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, 256 * 1024);
+            socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, localAddress.GetAddressBytes());
+            socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastLoopback, false);
+            socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastTimeToLive, 1);
+        }
+
+        private static IEnumerable<(byte[] Payload, IPEndPoint Endpoint)> BuildProbeSequence()
+        {
+            yield return (Encoding.UTF8.GetBytes(BuildStandardDeviceProbeMessage($"uuid:{Guid.NewGuid()}")), DiscoveryEndpoint);
+            yield return (Encoding.UTF8.GetBytes(BuildNetworkVideoTransmitterProbeMessage($"uuid:{Guid.NewGuid()}")), DiscoveryEndpoint);
+
+            string broadcastProbe = BuildUniviewBroadcastProbeMessage($"urn:uuid:{Guid.NewGuid()}" );
+            byte[] broadcastPayload = Encoding.UTF8.GetBytes(broadcastProbe);
+            for (int index = 0; index < BroadcastProbeRepeatCount; index++)
+            {
+                yield return (broadcastPayload, DiscoveryBroadcastEndpoint);
+            }
+        }
+
+        private static IEnumerable<OnvifDiscoveryDevice> ParseDiscoveryResponse(string payload, IPAddress remoteAddress)
+        {
+            var result = new List<OnvifDiscoveryDevice>();
+            string[] discoveryTypes = Array.Empty<string>();
+            string[] discoveryScopes = Array.Empty<string>();
+            bool hasTypeSignal = false;
+            bool hasScopeSignal = false;
+
+            try
+            {
+                XDocument document = XDocument.Parse(payload);
+                discoveryTypes = document
+                    .Descendants()
+                    .Where(element => string.Equals(element.Name.LocalName, "Types", StringComparison.Ordinal))
+                    .SelectMany(element => element.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+
+                discoveryScopes = document
+                    .Descendants()
+                    .Where(element => string.Equals(element.Name.LocalName, "Scopes", StringComparison.Ordinal))
+                    .SelectMany(element => element.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+
+                hasTypeSignal = discoveryTypes.Any(typeToken =>
+                    typeToken.Contains("NetworkVideoTransmitter", StringComparison.OrdinalIgnoreCase)
+                    || typeToken.Contains("onvif", StringComparison.OrdinalIgnoreCase));
+
+                hasScopeSignal = discoveryScopes.Any(scopeToken =>
+                    scopeToken.Contains("onvif", StringComparison.OrdinalIgnoreCase)
+                    || scopeToken.Contains("camera", StringComparison.OrdinalIgnoreCase)
+                    || scopeToken.Contains("video_encoder", StringComparison.OrdinalIgnoreCase)
+                    || scopeToken.Contains("network_video_transmitter", StringComparison.OrdinalIgnoreCase));
+
+                List<string> xAddressTokens = document
+                    .Descendants()
+                    .Where(element => string.Equals(element.Name.LocalName, "XAddrs", StringComparison.Ordinal))
+                    .SelectMany(element => element.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                    .ToList();
+
+                foreach (string token in xAddressTokens)
+                {
+                    if (!Uri.TryCreate(token, UriKind.Absolute, out Uri? uri))
+                    {
+                        continue;
+                    }
+
+                    if (!IPAddress.TryParse(uri.Host, out IPAddress? ipAddress) || ipAddress.AddressFamily != AddressFamily.InterNetwork)
+                    {
+                        continue;
+                    }
+
+                    bool hasOnvifXAddress = token.Contains("/onvif", StringComparison.OrdinalIgnoreCase);
+
+                    result.Add(new OnvifDiscoveryDevice
+                    {
+                        IpAddress = ipAddress.ToString(),
+                        XAddress = token,
+                        DiscoveryTypes = discoveryTypes,
+                        DiscoveryScopes = discoveryScopes,
+                        HasOnvifXAddress = hasOnvifXAddress,
+                        HasOnvifTypeSignal = hasTypeSignal,
+                        HasCameraLikeScopeSignal = hasScopeSignal,
+                        IsFallbackFromRemoteEndpoint = false
+                    });
+                }
+            }
+            catch
+            {
+                // 忽略解析失敗，改用遠端端點 IP 當備援
+            }
+
+            if (result.Count == 0 && remoteAddress.AddressFamily == AddressFamily.InterNetwork)
+            {
+                result.Add(new OnvifDiscoveryDevice
+                {
+                    IpAddress = remoteAddress.ToString(),
+                    XAddress = null,
+                    DiscoveryTypes = discoveryTypes,
+                    DiscoveryScopes = discoveryScopes,
+                    HasOnvifXAddress = false,
+                    HasOnvifTypeSignal = hasTypeSignal,
+                    HasCameraLikeScopeSignal = hasScopeSignal,
+                    IsFallbackFromRemoteEndpoint = true
+                });
+            }
+
+            return result;
+        }
+
+        private static OnvifDiscoveryDevice MergeDiscoveryDevice(OnvifDiscoveryDevice existingDevice, OnvifDiscoveryDevice incomingDevice)
+        {
+            string[] mergedTypes = existingDevice.DiscoveryTypes
+                .Concat(incomingDevice.DiscoveryTypes)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            string[] mergedScopes = existingDevice.DiscoveryScopes
+                .Concat(incomingDevice.DiscoveryScopes)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            return new OnvifDiscoveryDevice
+            {
+                IpAddress = existingDevice.IpAddress,
+                XAddress = string.IsNullOrWhiteSpace(existingDevice.XAddress) ? incomingDevice.XAddress : existingDevice.XAddress,
+                DiscoveryTypes = mergedTypes,
+                DiscoveryScopes = mergedScopes,
+                HasOnvifXAddress = existingDevice.HasOnvifXAddress || incomingDevice.HasOnvifXAddress,
+                HasOnvifTypeSignal = existingDevice.HasOnvifTypeSignal || incomingDevice.HasOnvifTypeSignal,
+                HasCameraLikeScopeSignal = existingDevice.HasCameraLikeScopeSignal || incomingDevice.HasCameraLikeScopeSignal,
+                IsFallbackFromRemoteEndpoint = existingDevice.IsFallbackFromRemoteEndpoint && incomingDevice.IsFallbackFromRemoteEndpoint
+            };
+        }
+
+        private static string BuildStandardDeviceProbeMessage(string messageId)
+        {
+            return $"<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+                   "<Envelope xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" " +
+                   "xmlns=\"http://www.w3.org/2003/05/soap-envelope\">" +
+                   "<Header>" +
+                   "<wsa:MessageID xmlns:wsa=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\">" + messageId + "</wsa:MessageID>" +
+                   "<wsa:To xmlns:wsa=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\">urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>" +
+                   "<wsa:Action xmlns:wsa=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\">http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</wsa:Action>" +
+                   "</Header>" +
+                   "<Body>" +
+                   "<Probe xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" xmlns=\"http://schemas.xmlsoap.org/ws/2005/04/discovery\">" +
+                   "<Types>tds:Device</Types>" +
+                   "<Scopes/>" +
+                   "</Probe>" +
+                   "</Body>" +
+                   "</Envelope>";
+        }
+
+        private static string BuildNetworkVideoTransmitterProbeMessage(string messageId)
+        {
+            return $"<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+                   "<e:Envelope xmlns:e=\"http://www.w3.org/2003/05/soap-envelope\" " +
+                   "xmlns:w=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\" " +
+                   "xmlns:d=\"http://schemas.xmlsoap.org/ws/2005/04/discovery\" " +
+                   "xmlns:dn=\"http://www.onvif.org/ver10/network/wsdl\">" +
+                   "<e:Header>" +
+                   "<w:MessageID>" + messageId + "</w:MessageID>" +
+                   "<w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>" +
+                   "<w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>" +
+                   "</e:Header>" +
+                   "<e:Body>" +
+                   "<d:Probe>" +
+                   "<d:Types>dn:NetworkVideoTransmitter</d:Types>" +
+                   "</d:Probe>" +
+                   "</e:Body>" +
+                   "</e:Envelope>";
+        }
+
+        private static string BuildUniviewBroadcastProbeMessage(string messageId)
+        {
+            return $"<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+                   "<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\" " +
+                   "xmlns:SOAP-ENC=\"http://www.w3.org/2003/05/soap-encoding\" " +
+                   "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" " +
+                   "xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" " +
+                   "xmlns:xop=\"http://www.w3.org/2004/08/xop/include\" " +
+                   "xmlns:wsa=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\" " +
+                   "xmlns:tns=\"http://schemas.xmlsoap.org/ws/2005/04/discovery\" " +
+                   "xmlns:dn=\"http://www.onvif.org/ver10/network/wsdl\" " +
+                   "xmlns:wsa5=\"http://www.w3.org/2005/08/addressing\">" +
+                   "<SOAP-ENV:Header>" +
+                   "<wsa:MessageID>" + messageId + "</wsa:MessageID>" +
+                   "<wsa:To SOAP-ENV:mustUnderstand=\"true\">urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>" +
+                   "<wsa:Action SOAP-ENV:mustUnderstand=\"true\">http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</wsa:Action>" +
+                   "</SOAP-ENV:Header>" +
+                   "<SOAP-ENV:Body>" +
+                   "<tns:UniviewProbe>" +
+                   "<tns:Types>dn:NetworkVideoTransmitter</tns:Types>" +
+                   "</tns:UniviewProbe>" +
+                   "</SOAP-ENV:Body>" +
+                   "</SOAP-ENV:Envelope>";
+        }
+
+        private static long ToSortableIpv4Value(string ipAddress)
+        {
+            if (!IPAddress.TryParse(ipAddress, out IPAddress? parsedIp) || parsedIp.AddressFamily != AddressFamily.InterNetwork)
+            {
+                return long.MaxValue;
+            }
+
+            byte[] bytes = parsedIp.GetAddressBytes();
+            return ((long)bytes[0] << 24) | ((long)bytes[1] << 16) | ((long)bytes[2] << 8) | bytes[3];
+        }
+    }
+}
+

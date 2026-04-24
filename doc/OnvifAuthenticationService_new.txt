@@ -1,0 +1,503 @@
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Xml.Linq;
+using IPCAM_Manger.Models;
+
+namespace IPCAM_Manger.Services
+{
+    public class OnvifCredentialMatchResult
+    {
+        public bool IsMatched { get; init; }
+        public string Username { get; init; } = string.Empty;
+        public string Password { get; init; } = string.Empty;
+        public DateTime? CameraCurrentTime { get; init; }
+        public string CameraTimeZone { get; init; } = string.Empty;
+        public int Stream1Fps { get; init; }
+        public string Stream1Quality { get; init; } = string.Empty;
+        public int Stream2Fps { get; init; }
+        public string Stream2Quality { get; init; } = string.Empty;
+        // 設定回寫所需的連線 metadata
+        public string DeviceEndpoint { get; init; } = string.Empty;
+        public string MediaEndpoint { get; init; } = string.Empty;
+        public string Stream1VecToken { get; init; } = string.Empty;
+        public int Stream1Width { get; init; }
+        public int Stream1Height { get; init; }
+        public string Stream2VecToken { get; init; } = string.Empty;
+        public int Stream2Width { get; init; }
+        public int Stream2Height { get; init; }
+    }
+
+    public class OnvifAuthenticationService
+    {
+        private const string GetDeviceInformationSoapEnvelope =
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+            "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">" +
+            "<s:Body>" +
+            "<tds:GetDeviceInformation/>" +
+            "</s:Body>" +
+            "</s:Envelope>";
+
+        private const string GetCapabilitiesSoapEnvelope =
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+            "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">" +
+            "<s:Body>" +
+            "<tds:GetCapabilities><tds:Category>All</tds:Category></tds:GetCapabilities>" +
+            "</s:Body>" +
+            "</s:Envelope>";
+
+        private const string GetSystemDateAndTimeSoapEnvelope =
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+            "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">" +
+            "<s:Body>" +
+            "<tds:GetSystemDateAndTime/>" +
+            "</s:Body>" +
+            "</s:Envelope>";
+
+        private const string GetProfilesSoapEnvelope =
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+            "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\">" +
+            "<s:Body>" +
+            "<trt:GetProfiles/>" +
+            "</s:Body>" +
+            "</s:Envelope>";
+
+        private const string DeviceWsdlNamespace = "http://www.onvif.org/ver10/device/wsdl";
+        private const string MediaWsdlNamespace = "http://www.onvif.org/ver10/media/wsdl";
+
+        private sealed class OnvifStreamProfileInfo
+        {
+            public int Fps { get; init; }
+            public string Quality { get; init; } = string.Empty;
+            public int Width { get; init; }
+            public int Height { get; init; }
+            public string VecToken { get; init; } = string.Empty;
+        }
+
+        private sealed class OnvifSystemDateTimeInfo
+        {
+            public DateTime? CameraCurrentTime { get; init; }
+            public string CameraTimeZone { get; init; } = string.Empty;
+        }
+
+        public async Task<OnvifCredentialMatchResult> FindWorkingCredentialAsync(
+            OnvifDiscoveryDevice device,
+            IReadOnlyCollection<DeviceCredential> credentialLibrary,
+            CancellationToken cancellationToken)
+        {
+            if (credentialLibrary.Count == 0)
+            {
+                return new OnvifCredentialMatchResult { IsMatched = false };
+            }
+
+            string deviceEndpoint = ResolveEndpoint(device);
+
+            foreach (DeviceCredential credential in credentialLibrary)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                bool authenticated = await TryAuthenticateAsync(
+                    deviceEndpoint,
+                    credential.Username,
+                    credential.Password,
+                    cancellationToken);
+
+                if (authenticated)
+                {
+                    OnvifSystemDateTimeInfo dateTimeInfo = await TryGetCameraDateTimeInfoAsync(
+                        deviceEndpoint,
+                        credential.Username,
+                        credential.Password,
+                        cancellationToken);
+
+                    string? mediaEndpoint = await ResolveMediaEndpointAsync(
+                        deviceEndpoint,
+                        credential.Username,
+                        credential.Password,
+                        cancellationToken);
+
+                    IReadOnlyList<OnvifStreamProfileInfo> streamProfiles = await TryGetStreamProfilesAsync(
+                        string.IsNullOrWhiteSpace(mediaEndpoint) ? deviceEndpoint : mediaEndpoint,
+                        credential.Username,
+                        credential.Password,
+                        cancellationToken);
+
+                    if (streamProfiles.Count == 0
+                        && !string.IsNullOrWhiteSpace(mediaEndpoint)
+                        && !string.Equals(mediaEndpoint, deviceEndpoint, StringComparison.OrdinalIgnoreCase))
+                    {
+                        streamProfiles = await TryGetStreamProfilesAsync(
+                            deviceEndpoint,
+                            credential.Username,
+                            credential.Password,
+                            cancellationToken);
+                    }
+
+                    OnvifStreamProfileInfo? stream1 = streamProfiles.ElementAtOrDefault(0);
+                    OnvifStreamProfileInfo? stream2 = streamProfiles.ElementAtOrDefault(1);
+                    string resolvedMediaEndpoint = mediaEndpoint ?? string.Empty;
+
+                    return new OnvifCredentialMatchResult
+                    {
+                        IsMatched = true,
+                        Username = credential.Username,
+                        Password = credential.Password,
+                        CameraCurrentTime = dateTimeInfo.CameraCurrentTime,
+                        CameraTimeZone = dateTimeInfo.CameraTimeZone,
+                        Stream1Fps = stream1?.Fps ?? 0,
+                        Stream1Quality = stream1?.Quality ?? string.Empty,
+                        Stream2Fps = stream2?.Fps ?? 0,
+                        Stream2Quality = stream2?.Quality ?? string.Empty,
+                        DeviceEndpoint = deviceEndpoint,
+                        MediaEndpoint = resolvedMediaEndpoint,
+                        Stream1VecToken = stream1?.VecToken ?? string.Empty,
+                        Stream1Width = stream1?.Width ?? 0,
+                        Stream1Height = stream1?.Height ?? 0,
+                        Stream2VecToken = stream2?.VecToken ?? string.Empty,
+                        Stream2Width = stream2?.Width ?? 0,
+                        Stream2Height = stream2?.Height ?? 0,
+                    };
+                }
+            }
+
+            return new OnvifCredentialMatchResult { IsMatched = false };
+        }
+
+        private static string ResolveEndpoint(OnvifDiscoveryDevice device)
+        {
+            if (!string.IsNullOrWhiteSpace(device.XAddress)
+                && Uri.TryCreate(device.XAddress, UriKind.Absolute, out Uri? xAddressUri))
+            {
+                return xAddressUri.ToString();
+            }
+
+            return $"http://{device.IpAddress}/onvif/device_service";
+        }
+
+        private static async Task<bool> TryAuthenticateAsync(
+            string endpoint,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            string? body = await TrySendSoapRequestAsync(
+                endpoint,
+                GetDeviceInformationSoapEnvelope,
+                $"{DeviceWsdlNamespace}/GetDeviceInformation",
+                username,
+                password,
+                cancellationToken);
+
+            return !string.IsNullOrWhiteSpace(body)
+                && (body.Contains("GetDeviceInformationResponse", StringComparison.OrdinalIgnoreCase)
+                    || body.Contains("Manufacturer", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static async Task<OnvifSystemDateTimeInfo> TryGetCameraDateTimeInfoAsync(
+            string endpoint,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            string? body = await TrySendSoapRequestAsync(
+                endpoint,
+                GetSystemDateAndTimeSoapEnvelope,
+                $"{DeviceWsdlNamespace}/GetSystemDateAndTime",
+                username,
+                password,
+                cancellationToken);
+
+            if (string.IsNullOrWhiteSpace(body))
+            {
+                return new OnvifSystemDateTimeInfo();
+            }
+
+            try
+            {
+                XDocument document = XDocument.Parse(body);
+                string timeZone = TryGetDescendantString(document.Root, "TZ");
+                DateTime? localTime = TryParseDateTimeNode(document, "LocalDateTime", DateTimeKind.Unspecified);
+                if (localTime.HasValue)
+                {
+                    return new OnvifSystemDateTimeInfo
+                    {
+                        CameraCurrentTime = localTime,
+                        CameraTimeZone = timeZone
+                    };
+                }
+
+                DateTime? utcTime = TryParseDateTimeNode(document, "UTCDateTime", DateTimeKind.Utc);
+                return new OnvifSystemDateTimeInfo
+                {
+                    CameraCurrentTime = utcTime?.ToLocalTime(),
+                    CameraTimeZone = timeZone
+                };
+            }
+            catch
+            {
+                return new OnvifSystemDateTimeInfo();
+            }
+        }
+
+        private static async Task<string?> ResolveMediaEndpointAsync(
+            string deviceEndpoint,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            string? body = await TrySendSoapRequestAsync(
+                deviceEndpoint,
+                GetCapabilitiesSoapEnvelope,
+                $"{DeviceWsdlNamespace}/GetCapabilities",
+                username,
+                password,
+                cancellationToken);
+
+            if (string.IsNullOrWhiteSpace(body))
+            {
+                return null;
+            }
+
+            try
+            {
+                XDocument document = XDocument.Parse(body);
+
+                IEnumerable<XElement> mediaNodes = document.Descendants()
+                    .Where(element =>
+                        string.Equals(element.Name.LocalName, "Media", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(element.Name.LocalName, "Media2", StringComparison.OrdinalIgnoreCase));
+
+                foreach (XElement mediaNode in mediaNodes)
+                {
+                    string? xAddress = mediaNode
+                        .Descendants()
+                        .FirstOrDefault(element => string.Equals(element.Name.LocalName, "XAddr", StringComparison.OrdinalIgnoreCase))?
+                        .Value?
+                        .Trim();
+
+                    if (!string.IsNullOrWhiteSpace(xAddress)
+                        && Uri.TryCreate(xAddress, UriKind.Absolute, out Uri? mediaUri))
+                    {
+                        return mediaUri.ToString();
+                    }
+                }
+            }
+            catch
+            {
+                return null;
+            }
+
+            return null;
+        }
+
+        private static async Task<IReadOnlyList<OnvifStreamProfileInfo>> TryGetStreamProfilesAsync(
+            string mediaEndpoint,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            string? body = await TrySendSoapRequestAsync(
+                mediaEndpoint,
+                GetProfilesSoapEnvelope,
+                $"{MediaWsdlNamespace}/GetProfiles",
+                username,
+                password,
+                cancellationToken);
+
+            if (string.IsNullOrWhiteSpace(body))
+            {
+                return [];
+            }
+
+            try
+            {
+                return ParseStreamProfiles(body)
+                    .Take(2)
+                    .ToList();
+            }
+            catch
+            {
+                return [];
+            }
+        }
+
+        private static IEnumerable<OnvifStreamProfileInfo> ParseStreamProfiles(string soapBody)
+        {
+            XDocument document = XDocument.Parse(soapBody);
+            IEnumerable<XElement> profileElements = document.Descendants()
+                .Where(element => string.Equals(element.Name.LocalName, "Profiles", StringComparison.OrdinalIgnoreCase));
+
+            foreach (XElement profileElement in profileElements)
+            {
+                XElement? videoEncoderConfiguration = profileElement.Descendants()
+                    .FirstOrDefault(element => string.Equals(element.Name.LocalName, "VideoEncoderConfiguration", StringComparison.OrdinalIgnoreCase));
+
+                if (videoEncoderConfiguration == null)
+                {
+                    continue;
+                }
+
+                int fps = TryGetDescendantInt(videoEncoderConfiguration, "FrameRateLimit") ?? 0;
+                int? width = TryGetDescendantInt(videoEncoderConfiguration, "Width");
+                int? height = TryGetDescendantInt(videoEncoderConfiguration, "Height");
+                string vecToken = videoEncoderConfiguration.Attribute("token")?.Value?.Trim() ?? string.Empty;
+
+                yield return new OnvifStreamProfileInfo
+                {
+                    Fps = fps,
+                    Quality = BuildQualityLabel(width, height),
+                    Width = width ?? 0,
+                    Height = height ?? 0,
+                    VecToken = vecToken,
+                };
+            }
+        }
+
+        private static string BuildQualityLabel(int? width, int? height)
+        {
+            if (!width.HasValue || !height.HasValue || width <= 0 || height <= 0)
+            {
+                return string.Empty;
+            }
+
+            if (height >= 1080 || width >= 1920)
+            {
+                return "1080p";
+            }
+
+            if (height >= 720 || width >= 1280)
+            {
+                return "720p";
+            }
+
+            if (height >= 480 || width >= 640)
+            {
+                return "480p";
+            }
+
+            if (height >= 360 || width >= 480)
+            {
+                return "360p";
+            }
+
+            return $"{width}x{height}";
+        }
+
+        private static DateTime? TryParseDateTimeNode(XDocument document, string nodeName, DateTimeKind kind)
+        {
+            XElement? dateTimeNode = document.Descendants()
+                .FirstOrDefault(element => string.Equals(element.Name.LocalName, nodeName, StringComparison.OrdinalIgnoreCase));
+
+            if (dateTimeNode == null)
+            {
+                return null;
+            }
+
+            int? year = TryGetDescendantInt(dateTimeNode, "Year");
+            int? month = TryGetDescendantInt(dateTimeNode, "Month");
+            int? day = TryGetDescendantInt(dateTimeNode, "Day");
+            int? hour = TryGetDescendantInt(dateTimeNode, "Hour");
+            int? minute = TryGetDescendantInt(dateTimeNode, "Minute");
+            int? second = TryGetDescendantInt(dateTimeNode, "Second");
+
+            if (!year.HasValue || !month.HasValue || !day.HasValue
+                || !hour.HasValue || !minute.HasValue || !second.HasValue)
+            {
+                return null;
+            }
+
+            try
+            {
+                return new DateTime(
+                    year.Value,
+                    month.Value,
+                    day.Value,
+                    hour.Value,
+                    minute.Value,
+                    second.Value,
+                    kind);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static int? TryGetDescendantInt(XElement element, string nodeName)
+        {
+            XElement? target = element.Descendants()
+                .FirstOrDefault(descendant => string.Equals(descendant.Name.LocalName, nodeName, StringComparison.OrdinalIgnoreCase));
+
+            return target != null && int.TryParse(target.Value, out int parsedValue)
+                ? parsedValue
+                : null;
+        }
+
+        private static string TryGetDescendantString(XElement? element, string nodeName)
+        {
+            XElement? target = element?
+                .Descendants()
+                .FirstOrDefault(descendant => string.Equals(descendant.Name.LocalName, nodeName, StringComparison.OrdinalIgnoreCase));
+
+            return target?.Value?.Trim() ?? string.Empty;
+        }
+
+        internal static async Task<string?> TrySendSoapRequestAsync(
+            string endpoint,
+            string soapEnvelope,
+            string soapAction,
+            string username,
+            string password,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                using var handler = new HttpClientHandler
+                {
+                    UseDefaultCredentials = false,
+                    PreAuthenticate = true,
+                    Credentials = new NetworkCredential(username, password),
+                    ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+                };
+
+                using var client = new HttpClient(handler)
+                {
+                    Timeout = TimeSpan.FromSeconds(5)
+                };
+
+                using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+                {
+                    Content = new StringContent(soapEnvelope, Encoding.UTF8, "application/soap+xml")
+                };
+
+                request.Headers.TryAddWithoutValidation("SOAPAction", soapAction);
+
+                using HttpResponseMessage response = await client.SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken);
+
+                if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                {
+                    return null;
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    return null;
+                }
+
+                return await response.Content.ReadAsStringAsync(cancellationToken);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                return null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+}
+
