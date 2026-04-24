@@ -54,7 +54,23 @@ public static class CliCommandParser
         {
             if (args.Length < 3)
             {
-                return Invalid("/ntpserver firewall requires action: status|enable|disable|repair");
+                return Invalid("/ntpserver firewall requires action: status|enable|disable|repair|mode open|strict");
+            }
+
+            if (args[2].Equals("mode", StringComparison.OrdinalIgnoreCase))
+            {
+                if (args.Length < 4)
+                {
+                    return Invalid("/ntpserver firewall mode requires profile: open|strict");
+                }
+
+                var profile = args[3].ToLowerInvariant();
+                if (profile is not ("open" or "strict"))
+                {
+                    return Invalid("/ntpserver firewall mode supports only: open|strict");
+                }
+
+                return Build(CommandGroup.Firewall, "firewall-mode", args[4..], $"mode-{profile}");
             }
 
             return Build(CommandGroup.Firewall, "firewall", args[3..], args[2].ToLowerInvariant());

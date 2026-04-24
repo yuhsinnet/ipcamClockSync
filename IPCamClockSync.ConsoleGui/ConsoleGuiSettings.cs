@@ -16,6 +16,8 @@ public sealed class ConsoleGuiSettings
 
     public int MaxConcurrency { get; set; } = 1;
 
+    public string FirewallProfileMode { get; set; } = "open";
+
     public static ConsoleGuiSettings Load(string filePath)
     {
         if (!File.Exists(filePath))

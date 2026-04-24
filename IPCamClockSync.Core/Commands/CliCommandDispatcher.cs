@@ -75,6 +75,8 @@ public sealed class CliCommandDispatcher
             "disable" => _firewall.Disable(),
             "status" => _firewall.Status(),
             "repair" => _firewall.Repair(),
+            "mode-open" => _firewall.SetOpenMode(),
+            "mode-strict" => _firewall.SetStrictMode(),
             _ => new CommandRunResult { ExitCode = 2, Output = "Unsupported firewall action." },
         };
 
@@ -102,6 +104,7 @@ service:
 
 firewall:
   /ntpserver firewall status|enable|disable|repair
+    /ntpserver firewall mode open|strict
 
 help:
   /h";

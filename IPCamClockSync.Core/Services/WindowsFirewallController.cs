@@ -15,7 +15,23 @@ public sealed class WindowsFirewallController
 
     public CommandRunResult Enable() => _runner.Run(
         "netsh",
-        $"advfirewall firewall add rule name=\"{RuleName}\" dir=in action=allow protocol=UDP localport=123 profile=any");
+        $"advfirewall firewall add rule name=\"{RuleName}\" dir=in action=allow protocol=UDP localport=123 profile=any remoteip=any");
+
+    public CommandRunResult SetOpenMode()
+    {
+        _runner.Run("netsh", $"advfirewall firewall delete rule name=\"{RuleName}\"");
+        return _runner.Run(
+            "netsh",
+            $"advfirewall firewall add rule name=\"{RuleName}\" dir=in action=allow protocol=UDP localport=123 profile=any remoteip=any");
+    }
+
+    public CommandRunResult SetStrictMode()
+    {
+        _runner.Run("netsh", $"advfirewall firewall delete rule name=\"{RuleName}\"");
+        return _runner.Run(
+            "netsh",
+            $"advfirewall firewall add rule name=\"{RuleName}\" dir=in action=allow protocol=UDP localport=123 profile=domain,private remoteip=localsubnet");
+    }
 
     public CommandRunResult Disable() => _runner.Run(
         "netsh",
@@ -28,6 +44,6 @@ public sealed class WindowsFirewallController
     public CommandRunResult Repair()
     {
         _runner.Run("netsh", $"advfirewall firewall delete rule name=\"{RuleName}\"");
-        return Enable();
+        return SetOpenMode();
     }
 }

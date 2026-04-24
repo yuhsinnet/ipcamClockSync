@@ -1,3 +1,6 @@
+using IPCamClockSync.Core.Runtime;
+using IPCamClockSync.Core.Services;
+
 namespace IPCamClockSync.ConsoleGui;
 
 public sealed class ConsoleGuiApp
@@ -5,6 +8,7 @@ public sealed class ConsoleGuiApp
     private const int SettingBlinkIntervalMs = 420;
 
     private readonly string _settingsFilePath;
+    private readonly WindowsFirewallController _firewallController;
     private ConsoleGuiSettings _settings;
     private int _mainMenuSelectedIndex = 0;
     private int _settingsMenuSelectedIndex = 0;
@@ -13,6 +17,8 @@ public sealed class ConsoleGuiApp
     {
         _settingsFilePath = Path.Combine(AppContext.BaseDirectory, "config", "consolegui.settings.json");
         _settings = ConsoleGuiSettings.Load(_settingsFilePath);
+        _settings.FirewallProfileMode = NormalizeFirewallMode(_settings.FirewallProfileMode);
+        _firewallController = new WindowsFirewallController(new ProcessCommandRunner());
     }
 
     public void Run()
@@ -22,6 +28,7 @@ public sealed class ConsoleGuiApp
         var mainItems = new[]
         {
             "掃描攝影機 (Phase 1 待實作)",
+            "保存清單 (Phase 1 待實作)",
             "自動單次更新時間 (Phase 2 待實作)",
             "自動設定 NTP (Phase 2 待實作)",
             "設定",
@@ -52,15 +59,18 @@ public sealed class ConsoleGuiApp
                     ShowPlaceholder("掃描攝影機", "下一階段將接上 ONVIF WS-Discovery 掃描與分頁清單。");
                     break;
                 case 1:
-                    ShowPlaceholder("單次更新時間", "下一階段將接上攝影機清單讀取與逐台時間推送。");
+                    ShowPlaceholder("保存清單", "下一階段將接上掃描結果多選保存與 cameras.json 寫入流程。");
                     break;
                 case 2:
-                    ShowPlaceholder("設定 NTP", "下一階段將接上攝影機 NTP 目標位址推送流程。");
+                    ShowPlaceholder("單次更新時間", "下一階段將接上攝影機清單讀取與逐台時間推送。");
                     break;
                 case 3:
-                    ShowSettingsMenu();
+                    ShowPlaceholder("設定 NTP", "下一階段將接上攝影機 NTP 目標位址推送流程。");
                     break;
                 case 4:
+                    ShowSettingsMenu();
+                    break;
+                case 5:
                     return;
             }
         }
@@ -103,6 +113,7 @@ public sealed class ConsoleGuiApp
         var numericBuffer = string.Empty;
         var originalNumericValue = 0;
         var originalBoolValue = false;
+        var originalFirewallMode = working.FirewallProfileMode;
         var lastBlinkAt = DateTime.UtcNow;
         var canControlCursor = OperatingSystem.IsWindows();
         var previousCursorVisible = true;
@@ -131,10 +142,10 @@ public sealed class ConsoleGuiApp
                     switch (key.Key)
                     {
                         case ConsoleKey.UpArrow:
-                            selectedIndex = (selectedIndex - 1 + 7) % 7;
+                            selectedIndex = (selectedIndex - 1 + 8) % 8;
                             break;
                         case ConsoleKey.DownArrow:
-                            selectedIndex = (selectedIndex + 1) % 7;
+                            selectedIndex = (selectedIndex + 1) % 8;
                             break;
                         case ConsoleKey.Enter:
                             switch (selectedIndex)
@@ -163,11 +174,17 @@ public sealed class ConsoleGuiApp
                                     originalBoolValue = working.ShowInstructionsNextTime;
                                     break;
                                 case 5:
+                                    editMode = SettingEditMode.FirewallProfile;
+                                    originalFirewallMode = working.FirewallProfileMode;
+                                    break;
+                                case 6:
                                     _settings = working;
+                                    _settings.FirewallProfileMode = NormalizeFirewallMode(_settings.FirewallProfileMode);
                                     SaveSettings();
+                                    ApplyFirewallMode(_settings.FirewallProfileMode);
                                     _settingsMenuSelectedIndex = selectedIndex;
                                     return;
-                                case 6:
+                                case 7:
                                     _settingsMenuSelectedIndex = selectedIndex;
                                     return;
                             }
@@ -204,6 +221,16 @@ public sealed class ConsoleGuiApp
                         ref editMode,
                         ref numericBuffer,
                         originalNumericValue,
+                        editKey);
+                    continue;
+                }
+
+                if (editMode == SettingEditMode.FirewallProfile)
+                {
+                    HandleFirewallProfileEditKey(
+                        ref working,
+                        ref editMode,
+                        originalFirewallMode,
                         editKey);
                     continue;
                 }
@@ -302,6 +329,29 @@ public sealed class ConsoleGuiApp
         }
     }
 
+    private static void HandleFirewallProfileEditKey(
+        ref ConsoleGuiSettings working,
+        ref SettingEditMode editMode,
+        string originalValue,
+        ConsoleKeyInfo key)
+    {
+        switch (key.Key)
+        {
+            case ConsoleKey.LeftArrow:
+            case ConsoleKey.RightArrow:
+                working.FirewallProfileMode = ToggleFirewallMode(working.FirewallProfileMode);
+                break;
+            case ConsoleKey.Enter:
+                working.FirewallProfileMode = NormalizeFirewallMode(working.FirewallProfileMode);
+                editMode = SettingEditMode.None;
+                break;
+            case ConsoleKey.Escape:
+                working.FirewallProfileMode = NormalizeFirewallMode(originalValue);
+                editMode = SettingEditMode.None;
+                break;
+        }
+    }
+
     private static void SetNumericSetting(ref ConsoleGuiSettings working, int selectedIndex, int value)
     {
         switch (selectedIndex)
@@ -380,8 +430,15 @@ public sealed class ConsoleGuiApp
             isEditingValue: selectedIndex == 4 && editMode == SettingEditMode.Boolean,
             blinkOn: blinkOn);
 
-        RenderActionLine("儲存併返回主選單", selectedIndex == 5, editMode == SettingEditMode.None);
-        RenderActionLine("返回主選單 (不儲存)", selectedIndex == 6, editMode == SettingEditMode.None);
+        RenderSettingLine(
+            "防火牆模式",
+            NormalizeFirewallMode(working.FirewallProfileMode),
+            isSelected: selectedIndex == 5,
+            isEditingValue: selectedIndex == 5 && editMode == SettingEditMode.FirewallProfile,
+            blinkOn: blinkOn);
+
+        RenderActionLine("儲存併返回主選單", selectedIndex == 6, editMode == SettingEditMode.None);
+        RenderActionLine("返回主選單 (不儲存)", selectedIndex == 7, editMode == SettingEditMode.None);
 
         WriteUiLine(string.Empty);
 
@@ -494,16 +551,40 @@ public sealed class ConsoleGuiApp
             ScanDurationSeconds = source.ScanDurationSeconds,
             ConnectionTimeoutSeconds = source.ConnectionTimeoutSeconds,
             MaxConcurrency = source.MaxConcurrency,
+            FirewallProfileMode = NormalizeFirewallMode(source.FirewallProfileMode),
         };
     }
 
     private static string ToBoolText(bool value) => value ? "true" : "false";
+
+    private static string ToggleFirewallMode(string mode)
+    {
+        return NormalizeFirewallMode(mode) == "open" ? "strict" : "open";
+    }
+
+    private static string NormalizeFirewallMode(string mode)
+    {
+        return mode.Equals("strict", StringComparison.OrdinalIgnoreCase) ? "strict" : "open";
+    }
+
+    private void ApplyFirewallMode(string mode)
+    {
+        var normalized = NormalizeFirewallMode(mode);
+        if (normalized == "strict")
+        {
+            _firewallController.SetStrictMode();
+            return;
+        }
+
+        _firewallController.SetOpenMode();
+    }
 
     private enum SettingEditMode
     {
         None,
         Numeric,
         Boolean,
+        FirewallProfile,
     }
 
     private static int SelectFromMenu(

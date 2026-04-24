@@ -34,4 +34,14 @@ public class UnitTest1
         Assert.Equal(CommandGroup.Firewall, parsed.Group);
         Assert.Equal("repair", parsed.Action);
     }
+
+    [Fact]
+    public void Parse_FirewallModeOpen_ShouldMapFirewallModeAction()
+    {
+        var parsed = CliCommandParser.Parse(new[] { "/ntpserver", "firewall", "mode", "open" });
+
+        Assert.True(parsed.IsValid);
+        Assert.Equal(CommandGroup.Firewall, parsed.Group);
+        Assert.Equal("mode-open", parsed.Action);
+    }
 }
