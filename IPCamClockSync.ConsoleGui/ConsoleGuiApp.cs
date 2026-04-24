@@ -1,3 +1,4 @@
+using System.Net;
 using IPCamClockSync.Core.Configuration;
 using IPCamClockSync.Core.Data;
 using IPCamClockSync.Core.Discovery;
@@ -725,10 +726,38 @@ public sealed class ConsoleGuiApp
 
     private void ShowScanWorkflow()
     {
+        // ── 網卡選擇 ──────────────────────────────────────────────────
+        var nics = OnvifWsDiscoveryService.GetAvailableNetworkInterfaces();
+        IReadOnlyList<IPAddress>? selectedBindAddresses = null;
+
+        if (nics.Count > 1)
+        {
+            var nicItems = new string[nics.Count + 1];
+            nicItems[0] = "全部網卡（自動偵測）";
+            for (int i = 0; i < nics.Count; i++)
+            {
+                nicItems[i + 1] = $"{nics[i].Address}  [{nics[i].Name}]";
+            }
+
+            var nicIndex = SelectFromMenu(
+                title: "選擇掃描網卡",
+                subtitle: "=============",
+                items: nicItems,
+                keyHint: "使用 ↑/↓ 移動，Enter 確認",
+                initialSelectedIndex: 0);
+
+            if (nicIndex > 0)
+            {
+                selectedBindAddresses = new[] { nics[nicIndex - 1].Address };
+            }
+        }
+        // ─────────────────────────────────────────────────────────────
+
         Console.Clear();
         Console.WriteLine("掃描攝影機");
         Console.WriteLine("--------");
-        Console.WriteLine($"使用 WS-Discovery 掃描 {_settings.ScanDurationSeconds} 秒...");
+        var nicLabel = selectedBindAddresses is { Count: > 0 } ? selectedBindAddresses[0].ToString() : "全部網卡";
+        Console.WriteLine($"使用 WS-Discovery 掃描 {_settings.ScanDurationSeconds} 秒... 網卡：{nicLabel}");
 
         try
         {
@@ -736,6 +765,7 @@ public sealed class ConsoleGuiApp
                     new DiscoveryOptions
                     {
                         ProbeTimeoutSeconds = _settings.ScanDurationSeconds,
+                        BindAddresses = selectedBindAddresses,
                     },
                     CancellationToken.None)
                 .GetAwaiter()
