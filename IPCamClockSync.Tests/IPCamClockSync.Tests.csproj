@@ -23,6 +23,7 @@
   <ItemGroup>
     <ProjectReference Include="..\IPCamClockSync.Core\IPCamClockSync.Core.csproj" />
     <ProjectReference Include="..\IPCamClockSync.Cli\IPCamClockSync.Cli.csproj" />
+    <ProjectReference Include="..\IPCamClockSync.NtpServer\IPCamClockSync.NtpServer.csproj" />
   </ItemGroup>
 
 </Project>
