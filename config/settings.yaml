@@ -1,0 +1,36 @@
+app:
+  language: zh-TW
+  showDisclaimerNextTime: false
+  showInstructionsNextTime: false
+
+scan:
+  durationSeconds: 5
+  timeoutSeconds: 15
+
+timeUpdate:
+  mode: sequential
+  maxConcurrency: 1
+  readSystemTimeBeforeEachUpdate: true
+
+ntpServer:
+  bindAddress: 0.0.0.0
+  port: 123
+  startupType: delayed-auto
+  serviceAccount: LocalService
+
+firewall:
+  profileMode: open
+  remoteScope: any
+  keepRuleOnUninstall: true
+
+logging:
+  format: jsonl
+  channels:
+    - app
+    - scan
+    - update
+    - ntp
+    - security
+  rotation:
+    maxFileSizeMb: 20
+    maxFileCount: 10

@@ -1,0 +1,14 @@
+{
+  "version": "1.0",
+  "cameras": [
+    {
+      "id": "cam-001",
+      "ip": "192.168.1.100",
+      "port": 80,
+      "username": "admin",
+      "password": "admin",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15
+    }
+  ]
+}
