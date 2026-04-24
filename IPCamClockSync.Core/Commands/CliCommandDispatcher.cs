@@ -403,22 +403,23 @@ public sealed class CliCommandDispatcher
     private static string HelpText() =>
 @"IPCamClockSync CLI
 
-operate:
-  /scan
-  /a
-  /set-ntp <ntp-ip>
-  /validate
-  /export
+operate:    (操作命令 — 相機掃描與設定)
+  /scan                   - 掃描網路並儲存發現的攝影機到 cameras.json
+  /a                      - 對所有啟用的攝影機執行一次時間更新預檢 (update-once)
+  /set-ntp <ntp-ip>       - 對所有啟用的攝影機設定 NTP 伺服器 IP
+  /validate               - 驗證 cameras.json 是否有效
+  /export                 - 匯出設定與 cameras.json 到 timestamp 資料夾
 
-service:
-  /ntpserver service install <path-to-exe>
-  /ntpserver service uninstall
-  /ntpserver start|stop|restart|status
+service:    (Windows 服務管理 — NTP Server)
+  /ntpserver service install <path-to-exe>   - 安裝 NTP server 服務
+  /ntpserver service uninstall               - 移除已安裝的服務
+  /ntpserver start|stop|restart|status       - 啟動/停止/重啟/查詢服務狀態
 
-firewall:
+firewall:   (防火牆管理 — 調整 NTP Server 所需規則)
   /ntpserver firewall status|enable|disable|repair
-    /ntpserver firewall mode open|strict
+    /ntpserver firewall mode open|strict     - open: 開放模式 (允許所需通訊)
+                                              - strict: 嚴格模式 (限制只允許必要的流量)
 
 help:
-  /h";
+  /h   - 顯示本說明（包含中文說明與範例用法）";
 }
