@@ -1,3 +1,6 @@
+using IPCamClockSync.Core.Configuration;
+using IPCamClockSync.Core.Data;
+using IPCamClockSync.Core.Discovery;
 using IPCamClockSync.Core.Runtime;
 using IPCamClockSync.Core.Services;
 
@@ -7,17 +10,35 @@ public sealed class ConsoleGuiApp
 {
     private const int SettingBlinkIntervalMs = 420;
 
-    private readonly string _settingsFilePath;
+    private readonly ApplicationDataPaths _paths;
+    private readonly string _guiSettingsFilePath;
     private readonly WindowsFirewallController _firewallController;
+    private readonly YamlSettingsStore _settingsStore;
+    private readonly CameraListStore _cameraListStore;
+    private readonly IOnvifDiscoveryService _discoveryService;
+    private AppSettings _appSettings;
+    private CameraListDocument _cameraList;
+    private CameraListDocument? _pendingScanDocument;
     private ConsoleGuiSettings _settings;
     private int _mainMenuSelectedIndex = 0;
     private int _settingsMenuSelectedIndex = 0;
 
     public ConsoleGuiApp()
     {
-        _settingsFilePath = Path.Combine(AppContext.BaseDirectory, "config", "consolegui.settings.json");
-        _settings = ConsoleGuiSettings.Load(_settingsFilePath);
-        _settings.FirewallProfileMode = NormalizeFirewallMode(_settings.FirewallProfileMode);
+        _paths = ApplicationDataPaths.Resolve();
+        _guiSettingsFilePath = _paths.GuiSettingsFilePath;
+        _settingsStore = new YamlSettingsStore();
+        _cameraListStore = new CameraListStore();
+        _discoveryService = new OnvifWsDiscoveryService();
+        _appSettings = _settingsStore.Load(_paths.SettingsFilePath);
+        _cameraList = _cameraListStore.Load(
+            _paths.CamerasFilePath,
+            new CameraListStoreOptions
+            {
+                EnableCredentialEncryption = _appSettings.Security.ObfuscatePasswordsWithBase64,
+            });
+        _settings = ConsoleGuiSettings.Load(_guiSettingsFilePath);
+        ApplyAppSettingsToGuiState(_appSettings, _settings);
         _firewallController = new WindowsFirewallController(new ProcessCommandRunner());
     }
 
@@ -56,10 +77,10 @@ public sealed class ConsoleGuiApp
             switch (selectedIndex)
             {
                 case 0:
-                    ShowPlaceholder("掃描攝影機", "下一階段將接上 ONVIF WS-Discovery 掃描與分頁清單。");
+                    ShowScanWorkflow();
                     break;
                 case 1:
-                    ShowPlaceholder("保存清單", "下一階段將接上掃描結果多選保存與 cameras.json 寫入流程。");
+                    SavePendingCameraList();
                     break;
                 case 2:
                     ShowPlaceholder("單次更新時間", "下一階段將接上攝影機清單讀取與逐台時間推送。");
@@ -101,7 +122,7 @@ public sealed class ConsoleGuiApp
         }
 
         _settings.HasCompletedFirstRun = true;
-        _settings.Save(_settingsFilePath);
+        SaveGuiSettings();
     }
 
     private void ShowSettingsMenu()
@@ -142,10 +163,10 @@ public sealed class ConsoleGuiApp
                     switch (key.Key)
                     {
                         case ConsoleKey.UpArrow:
-                            selectedIndex = (selectedIndex - 1 + 8) % 8;
+                            selectedIndex = (selectedIndex - 1 + 9) % 9;
                             break;
                         case ConsoleKey.DownArrow:
-                            selectedIndex = (selectedIndex + 1) % 8;
+                            selectedIndex = (selectedIndex + 1) % 9;
                             break;
                         case ConsoleKey.Enter:
                             switch (selectedIndex)
@@ -178,13 +199,17 @@ public sealed class ConsoleGuiApp
                                     originalFirewallMode = working.FirewallProfileMode;
                                     break;
                                 case 6:
+                                    editMode = SettingEditMode.Boolean;
+                                    originalBoolValue = working.ObfuscatePasswordsWithBase64;
+                                    break;
+                                case 7:
                                     _settings = working;
                                     _settings.FirewallProfileMode = NormalizeFirewallMode(_settings.FirewallProfileMode);
                                     SaveSettings();
                                     ApplyFirewallMode(_settings.FirewallProfileMode);
                                     _settingsMenuSelectedIndex = selectedIndex;
                                     return;
-                                case 7:
+                                case 8:
                                     _settingsMenuSelectedIndex = selectedIndex;
                                     return;
                             }
@@ -311,6 +336,10 @@ public sealed class ConsoleGuiApp
                 {
                     working.ShowInstructionsNextTime = !working.ShowInstructionsNextTime;
                 }
+                else if (selectedIndex == 6)
+                {
+                    working.ObfuscatePasswordsWithBase64 = !working.ObfuscatePasswordsWithBase64;
+                }
                 break;
             case ConsoleKey.Enter:
                 editMode = SettingEditMode.None;
@@ -323,6 +352,10 @@ public sealed class ConsoleGuiApp
                 else if (selectedIndex == 4)
                 {
                     working.ShowInstructionsNextTime = originalValue;
+                }
+                else if (selectedIndex == 6)
+                {
+                    working.ObfuscatePasswordsWithBase64 = originalValue;
                 }
                 editMode = SettingEditMode.None;
                 break;
@@ -437,8 +470,15 @@ public sealed class ConsoleGuiApp
             isEditingValue: selectedIndex == 5 && editMode == SettingEditMode.FirewallProfile,
             blinkOn: blinkOn);
 
-        RenderActionLine("儲存併返回主選單", selectedIndex == 6, editMode == SettingEditMode.None);
-        RenderActionLine("返回主選單 (不儲存)", selectedIndex == 7, editMode == SettingEditMode.None);
+        RenderSettingLine(
+            "密碼非明碼儲存(base64)",
+            ToBoolText(working.ObfuscatePasswordsWithBase64),
+            isSelected: selectedIndex == 6,
+            isEditingValue: selectedIndex == 6 && editMode == SettingEditMode.Boolean,
+            blinkOn: blinkOn);
+
+        RenderActionLine("儲存併返回主選單", selectedIndex == 7, editMode == SettingEditMode.None);
+        RenderActionLine("返回主選單 (不儲存)", selectedIndex == 8, editMode == SettingEditMode.None);
 
         WriteUiLine(string.Empty);
 
@@ -552,6 +592,7 @@ public sealed class ConsoleGuiApp
             ConnectionTimeoutSeconds = source.ConnectionTimeoutSeconds,
             MaxConcurrency = source.MaxConcurrency,
             FirewallProfileMode = NormalizeFirewallMode(source.FirewallProfileMode),
+            ObfuscatePasswordsWithBase64 = source.ObfuscatePasswordsWithBase64,
         };
     }
 
@@ -672,7 +713,121 @@ public sealed class ConsoleGuiApp
 
     private void SaveSettings()
     {
-        _settings.Save(_settingsFilePath);
+        SaveGuiSettings();
+        ApplyGuiStateToAppSettings(_settings, _appSettings);
+        _settingsStore.Save(_paths.SettingsFilePath, _appSettings);
+    }
+
+    private void SaveGuiSettings()
+    {
+        _settings.Save(_guiSettingsFilePath);
+    }
+
+    private void ShowScanWorkflow()
+    {
+        Console.Clear();
+        Console.WriteLine("掃描攝影機");
+        Console.WriteLine("--------");
+        Console.WriteLine($"使用 WS-Discovery 掃描 {_settings.ScanDurationSeconds} 秒...");
+
+        try
+        {
+            var results = _discoveryService.DiscoverAsync(
+                    new DiscoveryOptions
+                    {
+                        ProbeTimeoutSeconds = _settings.ScanDurationSeconds,
+                    },
+                    CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+
+            _pendingScanDocument = DiscoveredCameraMapper.ToCameraList(results, _settings.ConnectionTimeoutSeconds);
+
+            Console.WriteLine();
+            Console.WriteLine($"找到 {_pendingScanDocument.Cameras.Count} 台設備。");
+            foreach (var camera in _pendingScanDocument.Cameras)
+            {
+                Console.WriteLine($"- {camera.Id} {camera.Ip}:{camera.Port}");
+            }
+
+            if (_pendingScanDocument.Cameras.Count == 0)
+            {
+                Console.WriteLine("未收到 ONVIF ProbeMatch 回應。");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"掃描失敗：{ex.Message}");
+        }
+
+        Console.WriteLine();
+        PrintKeyHint("按 Enter 返回；若找到設備，可到『保存清單』寫入 cameras.json");
+        Console.ReadLine();
+    }
+
+    private void SavePendingCameraList()
+    {
+        Console.Clear();
+        Console.WriteLine("保存清單");
+        Console.WriteLine("--------");
+
+        if (_pendingScanDocument is null)
+        {
+            Console.WriteLine("目前沒有待保存的掃描結果。請先執行『掃描攝影機』。");
+            Console.WriteLine();
+            PrintKeyHint("按 Enter 返回");
+            Console.ReadLine();
+            return;
+        }
+
+        try
+        {
+            _cameraListStore.Save(
+                _paths.CamerasFilePath,
+                _pendingScanDocument,
+                new CameraListStoreOptions
+                {
+                    EnableCredentialEncryption = _appSettings.Security.ObfuscatePasswordsWithBase64,
+                });
+
+            _cameraList = _pendingScanDocument;
+            _pendingScanDocument = null;
+
+            Console.WriteLine($"已保存 {_cameraList.Cameras.Count} 台設備到：");
+            Console.WriteLine(_paths.CamerasFilePath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"保存失敗：{ex.Message}");
+        }
+
+        Console.WriteLine();
+        PrintKeyHint("按 Enter 返回");
+        Console.ReadLine();
+    }
+
+    private static void ApplyAppSettingsToGuiState(AppSettings appSettings, ConsoleGuiSettings guiSettings)
+    {
+        guiSettings.ShowDisclaimerNextTime = appSettings.App.ShowDisclaimerNextTime;
+        guiSettings.ShowInstructionsNextTime = appSettings.App.ShowInstructionsNextTime;
+        guiSettings.ScanDurationSeconds = appSettings.Scan.DurationSeconds;
+        guiSettings.ConnectionTimeoutSeconds = appSettings.Scan.TimeoutSeconds;
+        guiSettings.MaxConcurrency = appSettings.TimeUpdate.MaxConcurrency;
+        guiSettings.FirewallProfileMode = NormalizeFirewallMode(appSettings.Firewall.ProfileMode);
+        guiSettings.ObfuscatePasswordsWithBase64 = appSettings.Security.ObfuscatePasswordsWithBase64;
+    }
+
+    private static void ApplyGuiStateToAppSettings(ConsoleGuiSettings guiSettings, AppSettings appSettings)
+    {
+        appSettings.App.ShowDisclaimerNextTime = guiSettings.ShowDisclaimerNextTime;
+        appSettings.App.ShowInstructionsNextTime = guiSettings.ShowInstructionsNextTime;
+        appSettings.Scan.DurationSeconds = guiSettings.ScanDurationSeconds;
+        appSettings.Scan.TimeoutSeconds = guiSettings.ConnectionTimeoutSeconds;
+        appSettings.TimeUpdate.MaxConcurrency = guiSettings.MaxConcurrency;
+        appSettings.Firewall.ProfileMode = NormalizeFirewallMode(guiSettings.FirewallProfileMode);
+        appSettings.Security.ObfuscatePasswordsWithBase64 = guiSettings.ObfuscatePasswordsWithBase64;
+        appSettings.Normalize();
     }
 
     private static bool AskShowNextTime(string prompt)

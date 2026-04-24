@@ -12,6 +12,8 @@ public sealed class AppSettings
 
     public FirewallSettings Firewall { get; set; } = new();
 
+    public SecuritySettings Security { get; set; } = new();
+
     public LoggingSettings Logging { get; set; } = new();
 
     public static AppSettings CreateDefault()
@@ -26,6 +28,7 @@ public sealed class AppSettings
         TimeUpdate ??= new TimeUpdateSettings();
         NtpServer ??= new NtpServerSettings();
         Firewall ??= new FirewallSettings();
+        Security ??= new SecuritySettings();
         Logging ??= new LoggingSettings();
 
         App.Normalize();
@@ -33,6 +36,7 @@ public sealed class AppSettings
         TimeUpdate.Normalize();
         NtpServer.Normalize();
         Firewall.Normalize();
+        Security.Normalize();
         Logging.Normalize();
     }
 }
@@ -106,12 +110,19 @@ public sealed class FirewallSettings
 
     public bool KeepRuleOnUninstall { get; set; } = true;
 
-    public bool EnableCredentialEncryption { get; set; }
-
     public void Normalize()
     {
         ProfileMode = ProfileMode.Equals("strict", StringComparison.OrdinalIgnoreCase) ? "strict" : "open";
         RemoteScope = string.IsNullOrWhiteSpace(RemoteScope) ? "any" : RemoteScope.Trim();
+    }
+}
+
+public sealed class SecuritySettings
+{
+    public bool ObfuscatePasswordsWithBase64 { get; set; }
+
+    public void Normalize()
+    {
     }
 }
 

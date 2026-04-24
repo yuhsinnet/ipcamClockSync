@@ -6,7 +6,7 @@ public static class WsDiscoveryMessageBuilder
     {
         return $"""
 <?xml version=\"1.0\" encoding=\"utf-8\"?>
-<e:Envelope xmlns:e=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:w=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\" xmlns:d=\"http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01\" xmlns:dn=\"http://www.onvif.org/ver10/network/wsdl\">
+<e:Envelope xmlns:e=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:w=\"http://www.w3.org/2005/08/addressing\" xmlns:d=\"http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01\" xmlns:dn=\"http://www.onvif.org/ver10/network/wsdl\">
   <e:Header>
     <w:MessageID>urn:uuid:{messageId}</w:MessageID>
     <w:To>urn:docs-oasis-open-org:ws-dd:ns:discovery:2009:01</w:To>

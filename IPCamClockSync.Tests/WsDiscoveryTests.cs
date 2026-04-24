@@ -11,6 +11,7 @@ public sealed class WsDiscoveryTests
 
         Assert.Contains("NetworkVideoTransmitter", xml, StringComparison.Ordinal);
         Assert.Contains("urn:uuid:11111111-1111-1111-1111-111111111111", xml, StringComparison.Ordinal);
+      Assert.Contains("http://www.w3.org/2005/08/addressing", xml, StringComparison.Ordinal);
     }
 
     [Fact]

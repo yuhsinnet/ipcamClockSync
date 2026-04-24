@@ -1,4 +1,7 @@
 using IPCamClockSync.Core.Commands;
+using IPCamClockSync.Core.Configuration;
+using IPCamClockSync.Core.Data;
+using IPCamClockSync.Core.Discovery;
 using IPCamClockSync.Core.Logging;
 using IPCamClockSync.Core.Runtime;
 using IPCamClockSync.Core.Services;
@@ -11,11 +14,18 @@ public static class CliHost
     {
         var correlationId = Guid.NewGuid().ToString("N");
         var parserResult = CliCommandParser.Parse(args);
+        var paths = ApplicationDataPaths.Resolve();
 
         var commandRunner = new ProcessCommandRunner();
         var serviceController = new NtpWindowsServiceController(commandRunner);
         var firewallController = new WindowsFirewallController(commandRunner);
-        var dispatcher = new CliCommandDispatcher(serviceController, firewallController);
+        var dispatcher = new CliCommandDispatcher(
+            paths,
+            new YamlSettingsStore(),
+            new CameraListStore(),
+            new OnvifWsDiscoveryService(),
+            serviceController,
+            firewallController);
 
         var result = dispatcher.Execute(parserResult);
 

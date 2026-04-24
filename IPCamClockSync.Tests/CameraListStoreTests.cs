@@ -84,13 +84,11 @@ public sealed class CameraListStoreTests
     [Fact]
     public void Save_WithEncryptionEnabled_ShouldPersistEncryptedPasswordAndLoadBack()
     {
-        var protector = new FakeCredentialProtector();
-        var store = new CameraListStore(protector);
+        var store = new CameraListStore(new Base64CredentialProtector());
         var path = Path.Combine(Path.GetTempPath(), $"ipcam-cameras-{Guid.NewGuid():N}.json");
         var options = new CameraListStoreOptions
         {
             EnableCredentialEncryption = true,
-            CredentialProtector = protector,
             AllowPlaintextFallback = false,
         };
 
@@ -106,15 +104,8 @@ public sealed class CameraListStoreTests
         var rawJson = File.ReadAllText(path);
         var loaded = store.Load(path, options);
 
-        Assert.Contains("enc:secret", rawJson);
+        Assert.Contains(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("secret")), rawJson);
         Assert.DoesNotContain("\"password\": \"secret\"", rawJson);
         Assert.Equal("secret", loaded.Cameras[0].Password);
-    }
-
-    private sealed class FakeCredentialProtector : ICredentialProtector
-    {
-        public string Protect(string plainText) => $"enc:{plainText}";
-
-        public string Unprotect(string protectedText) => protectedText.Replace("enc:", string.Empty, StringComparison.Ordinal);
     }
 }

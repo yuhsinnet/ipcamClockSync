@@ -23,6 +23,9 @@ firewall:
   remoteScope: any
   keepRuleOnUninstall: true
 
+security:
+  obfuscatePasswordsWithBase64: false
+
 logging:
   format: jsonl
   channels:

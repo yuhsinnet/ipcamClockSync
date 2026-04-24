@@ -15,6 +15,7 @@ public sealed class SettingsStoreTests
         Assert.Equal("zh-TW", settings.App.Language);
         Assert.Equal(5, settings.Scan.DurationSeconds);
         Assert.Equal("open", settings.Firewall.ProfileMode);
+        Assert.False(settings.Security.ObfuscatePasswordsWithBase64);
         Assert.Equal(20, settings.Logging.Rotation.MaxFileSizeMb);
     }
 
@@ -31,6 +32,7 @@ public sealed class SettingsStoreTests
         Assert.Equal(9, settings.Scan.DurationSeconds);
         Assert.Equal(15, settings.Scan.TimeoutSeconds);
         Assert.Equal("open", settings.Firewall.ProfileMode);
+        Assert.False(settings.Security.ObfuscatePasswordsWithBase64);
         Assert.Equal(10, settings.Logging.Rotation.MaxFileCount);
     }
 
@@ -42,7 +44,7 @@ public sealed class SettingsStoreTests
         var settings = AppSettings.CreateDefault();
         settings.Scan.DurationSeconds = 12;
         settings.Firewall.ProfileMode = "strict";
-        settings.Firewall.EnableCredentialEncryption = true;
+        settings.Security.ObfuscatePasswordsWithBase64 = true;
         settings.Logging.Rotation.MaxFileCount = 3;
 
         store.Save(path, settings);
@@ -50,7 +52,7 @@ public sealed class SettingsStoreTests
 
         Assert.Equal(12, loaded.Scan.DurationSeconds);
         Assert.Equal("strict", loaded.Firewall.ProfileMode);
-        Assert.True(loaded.Firewall.EnableCredentialEncryption);
+        Assert.True(loaded.Security.ObfuscatePasswordsWithBase64);
         Assert.Equal(3, loaded.Logging.Rotation.MaxFileCount);
     }
 }

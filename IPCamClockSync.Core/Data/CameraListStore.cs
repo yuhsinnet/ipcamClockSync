@@ -175,11 +175,6 @@ public sealed class CameraListStore
             return _credentialProtector;
         }
 
-        if (!OperatingSystem.IsWindows())
-        {
-            throw new PlatformNotSupportedException("Credential encryption is currently supported on Windows only.");
-        }
-
-        return new DpapiCredentialProtector();
+        return new Base64CredentialProtector();
     }
 }

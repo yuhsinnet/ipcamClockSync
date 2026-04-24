@@ -18,6 +18,8 @@ public sealed class ConsoleGuiSettings
 
     public string FirewallProfileMode { get; set; } = "open";
 
+    public bool ObfuscatePasswordsWithBase64 { get; set; }
+
     public static ConsoleGuiSettings Load(string filePath)
     {
         if (!File.Exists(filePath))
