@@ -44,6 +44,7 @@ public static class WsDiscoveryMessageParser
                         Address = c.IpAddress,
                         ServiceAddress = c.ServiceAddress,
                         Scopes = c.Scopes,
+                        Model = ExtractModelFromScopes(c.Scopes),
                     })
                     .Where(c => !string.IsNullOrWhiteSpace(c.Address) || !string.IsNullOrWhiteSpace(c.ServiceAddress))
                     .ToArray();
@@ -137,5 +138,38 @@ public static class WsDiscoveryMessageParser
         public string ServiceAddress { get; init; } = string.Empty;
         public bool HasOnvifXAddress { get; init; }
         public string[] Scopes { get; init; } = Array.Empty<string>();
+    }
+
+    private static string ExtractModelFromScopes(IEnumerable<string> scopes)
+    {
+        foreach (var scope in scopes)
+        {
+            if (TryExtractModelScope(scope, "onvif://www.onvif.org/name/", out var model) ||
+                TryExtractModelScope(scope, "onvif://www.onvif.org/hardware/", out model) ||
+                TryExtractModelScope(scope, "onvif://www.onvif.org/model/", out model))
+            {
+                return model;
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private static bool TryExtractModelScope(string scope, string prefix, out string model)
+    {
+        model = string.Empty;
+        if (!scope.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var value = scope[prefix.Length..].Trim();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        model = Uri.UnescapeDataString(value).Trim();
+        return !string.IsNullOrWhiteSpace(model);
     }
 }

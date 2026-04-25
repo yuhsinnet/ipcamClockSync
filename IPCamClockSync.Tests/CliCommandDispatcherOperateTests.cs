@@ -212,6 +212,17 @@ public sealed class CliCommandDispatcherOperateTests
 
         public Func<CameraRecord, OnvifOperationResult>? NtpModeHandler { get; init; }
 
+        public Func<CameraRecord, OnvifDeviceInformationResult>? DeviceInformationHandler { get; init; }
+
+        public Task<OnvifDeviceInformationResult> GetDeviceInformationAsync(
+            CameraRecord camera,
+            int timeoutSeconds,
+            CancellationToken cancellationToken)
+        {
+            var result = DeviceInformationHandler?.Invoke(camera) ?? OnvifDeviceInformationResult.Ok(string.Empty, string.Empty, string.Empty);
+            return Task.FromResult(result);
+        }
+
         public Task<OnvifOperationResult> SetSystemDateAndTimeAsync(
             CameraRecord camera,
             DateTimeOffset localNow,

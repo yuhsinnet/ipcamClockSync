@@ -3,12 +3,146 @@
   "cameras": [
     {
       "id": "cam-001",
-      "ip": "192.168.1.100",
+      "ip": "192.168.1.101",
       "port": 80,
-      "username": "admin",
-      "password": "admin",
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
       "enabled": true,
-      "connectionTimeoutSeconds": 15
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-002",
+      "ip": "192.168.1.133",
+      "port": 80,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-003",
+      "ip": "192.168.1.129",
+      "port": 80,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-004",
+      "ip": "192.168.0.127",
+      "port": 80,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-005",
+      "ip": "192.168.1.23",
+      "port": 80,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-006",
+      "ip": "192.168.1.63",
+      "port": 80,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-007",
+      "ip": "192.168.1.123",
+      "port": 80,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-008",
+      "ip": "192.168.1.131",
+      "port": 80,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-009",
+      "ip": "192.168.1.227",
+      "port": 80,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-010",
+      "ip": "192.168.1.140",
+      "port": 80,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-011",
+      "ip": "192.168.1.68",
+      "port": 8088,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-012",
+      "ip": "192.168.1.180",
+      "port": 80,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
+    },
+    {
+      "id": "cam-013",
+      "ip": "192.168.0.173",
+      "port": 8899,
+      "username": "",
+      "password": "",
+      "passwordEncrypted": "",
+      "enabled": true,
+      "connectionTimeoutSeconds": 15,
+      "ntpServerIp": ""
     }
   ]
 }

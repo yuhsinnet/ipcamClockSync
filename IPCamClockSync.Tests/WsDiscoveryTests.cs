@@ -45,4 +45,27 @@ public sealed class WsDiscoveryTests
         Assert.Single(matches);
         Assert.Equal("http://192.168.1.10/onvif/device_service", matches[0].ServiceAddress);
     }
+
+    [Fact]
+    public void ParseProbeMatches_ShouldExtractModelFromScopes()
+    {
+        var xml = """
+<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:d="http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01" xmlns:a="http://www.w3.org/2005/08/addressing">
+  <e:Body>
+    <d:ProbeMatches>
+      <d:ProbeMatch>
+        <a:EndpointReference><a:Address>urn:uuid:cam-1</a:Address></a:EndpointReference>
+        <d:Scopes>onvif://www.onvif.org/type/video_encoder onvif://www.onvif.org/hardware/IPC-HFW1230S</d:Scopes>
+        <d:XAddrs>http://192.168.1.10/onvif/device_service</d:XAddrs>
+      </d:ProbeMatch>
+    </d:ProbeMatches>
+  </e:Body>
+</e:Envelope>
+""";
+
+        var matches = WsDiscoveryMessageParser.ParseProbeMatches(xml);
+
+        Assert.Single(matches);
+        Assert.Equal("IPC-HFW1230S", matches[0].Model);
+    }
 }

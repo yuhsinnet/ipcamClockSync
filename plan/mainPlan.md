@@ -31,7 +31,7 @@
    3.4 並行更新能力：單執行緒/多執行緒切換與最大併發數。
       - 現況：已接入批次執行引擎，依 MaxConcurrency 控制並行度。
 
-4. Phase 3 - NTP Server 與服務控制（部分完成，可與 Phase 2 平行）
+4. Phase 3 - NTP Server 與服務控制（已完成）
    4.1 實作獨立 NTP Server 執行檔（UDP 123、狀態日誌、監控欄位）。
       - 現況：最小 NTP 回應服務已可運作。
    4.2 時間來源策略：先系統時間，保留外部上游擴充點。
@@ -47,7 +47,9 @@
    5.2 掃描流程畫面：動畫、結果分頁、進階掃描。
       - 現況：已完成 BIOS 風格操作與多輪 UX 微調，並新增網卡綁定選單。
    5.3 清單保存流程：多選保存、逐台覆寫帳密、儲存路徑詢問。
+      - 現況：GUI 已支援編號多選/區間選取、逐台帳密覆寫、自訂保存路徑。
    5.4 單次更新與 NTP 設定流程化。
+      - 現況：GUI 已接入 /a 與 /usentp 流程，執行邏輯與 CLI 共用同一套 dispatcher。
    5.5 設定頁：掃描時長、逾時、併發、匯出。
    5.6 NTP 服務控制頁：狀態、防火牆、設定編輯。
 
@@ -84,18 +86,18 @@
 - feat: 推進 Phase 2 並補齊 update/set-ntp 流程
 - 修復 WS-Discovery 掃描相容性並新增網卡綁定選單
 - 修正 ONVIF 時區送值格式並完成實機驗證（/a、/set-ntp）
+- feat: Console GUI 接入 /a 與 /usentp 實作流程（沿用 CLI dispatcher）
 
 ## Current Status
 - Phase 0: 完成
 - Phase 1: 完成（含 WS-Discovery 相容性修復）
 - Phase 2: 完成（ONVIF 時間同步/NTP 推送/重試分類/並行）
-- Phase 3: 部分完成（最小 NTP server + service/firewall 控制已具備）
+- Phase 3: 完成（NTP server、service install/uninstall/start/stop/restart/status、firewall status/enable/disable/repair/mode、cli verify 已可用）
 - Phase 4: 進行中（GUI 基礎功能與 UX 已有可用版本）
 - Phase 5: 進行中（核心命令可用，待完善錯誤碼與輸出規範）
 - Phase 6: 待開始
 
 ## Next Targets
-1. 將 /a、/set-ntp 流程完整接入 Console GUI（對應 Phase 4.4）。
+1. 補齊 GUI 設定頁與 NTP 服務控制頁（對應 Phase 4.5、4.6）。
 2. 補齊 CLI 靜默輸出規格與錯誤碼表（對應 Phase 5.3）。
-3. 補齊 config/diagnose 指令群（對應 Phase 5.6）。
-4. 進入 Phase 3/6 的服務化與部署穩定化驗證。
+3. 進入 Phase 6 的服務化部署與穩定化驗證。

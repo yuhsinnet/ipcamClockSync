@@ -4,6 +4,11 @@ namespace IPCamClockSync.Core.Services;
 
 public interface IOnvifDeviceManagementService
 {
+    Task<OnvifDeviceInformationResult> GetDeviceInformationAsync(
+        CameraRecord camera,
+        int timeoutSeconds,
+        CancellationToken cancellationToken);
+
     Task<OnvifOperationResult> SetSystemDateAndTimeAsync(
         CameraRecord camera,
         DateTimeOffset localNow,

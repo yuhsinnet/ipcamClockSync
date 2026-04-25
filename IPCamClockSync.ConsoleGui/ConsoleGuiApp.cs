@@ -1,4 +1,6 @@
 using System.Net;
+using System.Text;
+using IPCamClockSync.Core.Commands;
 using IPCamClockSync.Core.Configuration;
 using IPCamClockSync.Core.Data;
 using IPCamClockSync.Core.Discovery;
@@ -14,15 +16,21 @@ public sealed class ConsoleGuiApp
     private readonly ApplicationDataPaths _paths;
     private readonly string _guiSettingsFilePath;
     private readonly WindowsFirewallController _firewallController;
+    private readonly CliCommandDispatcher _cliDispatcher;
     private readonly YamlSettingsStore _settingsStore;
     private readonly CameraListStore _cameraListStore;
     private readonly IOnvifDiscoveryService _discoveryService;
+    private readonly IOnvifDeviceManagementService _deviceManagementService;
     private AppSettings _appSettings;
     private CameraListDocument _cameraList;
     private CameraListDocument? _pendingScanDocument;
     private ConsoleGuiSettings _settings;
     private int _mainMenuSelectedIndex = 0;
     private int _settingsMenuSelectedIndex = 0;
+    private int _scanNicSelectedIndex = 0;
+    private int _saveListSelectedIndex = 0;
+    private int _credentialMenuSelectedIndex = 0;
+    private int _credentialCameraSelectedIndex = 0;
 
     public ConsoleGuiApp()
     {
@@ -31,6 +39,7 @@ public sealed class ConsoleGuiApp
         _settingsStore = new YamlSettingsStore();
         _cameraListStore = new CameraListStore();
         _discoveryService = new OnvifWsDiscoveryService();
+        _deviceManagementService = new OnvifDeviceManagementService();
         _appSettings = _settingsStore.Load(_paths.SettingsFilePath);
         _cameraList = _cameraListStore.Load(
             _paths.CamerasFilePath,
@@ -41,6 +50,14 @@ public sealed class ConsoleGuiApp
         _settings = ConsoleGuiSettings.Load(_guiSettingsFilePath);
         ApplyAppSettingsToGuiState(_appSettings, _settings);
         _firewallController = new WindowsFirewallController(new ProcessCommandRunner());
+        _cliDispatcher = new CliCommandDispatcher(
+            _paths,
+            _settingsStore,
+            _cameraListStore,
+            _discoveryService,
+            _deviceManagementService,
+            new NtpWindowsServiceController(new ProcessCommandRunner()),
+            _firewallController);
     }
 
     public void Run()
@@ -49,29 +66,36 @@ public sealed class ConsoleGuiApp
 
         var mainItems = new[]
         {
-            "掃描攝影機 (Phase 1 待實作)",
-            "保存清單 (Phase 1 待實作)",
-            "自動單次更新時間 (Phase 2 待實作)",
-            "自動設定 NTP (Phase 2 待實作)",
+            "掃描攝影機",
+            "保存清單",
+            "單次更新時間 (/a)",
+            "設定 NTP 並切換模式 (/usentp)",
             "設定",
             "離開",
         };
 
         while (true)
         {
-            var selectedIndex = SelectFromMenu(
-                title: "IPCamClockSync Console GUI",
+            var menuResult = SelectFromMenu(
+                title: "IPCamClockSync Console GUI V20260425",
                 subtitle: "=========================",
                 items: mainItems,
                 keyHint: "使用 ↑/↓ 移動，Enter 確認，H 查看提示",
                 initialSelectedIndex: _mainMenuSelectedIndex,
                 allowHelpShortcut: true);
 
-            if (selectedIndex == -1)
+            if (menuResult.IsHelpRequested)
             {
                 ShowHelp();
                 continue;
             }
+
+            if (menuResult.IsCanceled)
+            {
+                continue;
+            }
+
+            var selectedIndex = menuResult.SelectedIndex;
 
             _mainMenuSelectedIndex = selectedIndex;
 
@@ -84,10 +108,10 @@ public sealed class ConsoleGuiApp
                     SavePendingCameraList();
                     break;
                 case 2:
-                    ShowPlaceholder("單次更新時間", "下一階段將接上攝影機清單讀取與逐台時間推送。");
+                    ShowUpdateOnceWorkflow();
                     break;
                 case 3:
-                    ShowPlaceholder("設定 NTP", "下一階段將接上攝影機 NTP 目標位址推送流程。");
+                    ShowUseNtpWorkflow();
                     break;
                 case 4:
                     ShowSettingsMenu();
@@ -629,7 +653,7 @@ public sealed class ConsoleGuiApp
         FirewallProfile,
     }
 
-    private static int SelectFromMenu(
+    private static MenuSelectionResult SelectFromMenu(
         string title,
         string subtitle,
         string[] items,
@@ -677,15 +701,26 @@ public sealed class ConsoleGuiApp
                     selectedIndex = (selectedIndex + 1) % items.Length;
                     break;
                 case ConsoleKey.Enter:
-                    return selectedIndex;
+                    return MenuSelectionResult.Confirm(selectedIndex);
+                case ConsoleKey.Escape:
+                    return MenuSelectionResult.Cancel(selectedIndex);
                 case ConsoleKey.H:
                     if (allowHelpShortcut)
                     {
-                        return -1;
+                        return MenuSelectionResult.Help(selectedIndex);
                     }
                     break;
             }
         }
+    }
+
+    private readonly record struct MenuSelectionResult(int SelectedIndex, bool IsCanceled, bool IsHelpRequested)
+    {
+        public static MenuSelectionResult Confirm(int selectedIndex) => new(selectedIndex, false, false);
+
+        public static MenuSelectionResult Cancel(int selectedIndex) => new(selectedIndex, true, false);
+
+        public static MenuSelectionResult Help(int selectedIndex) => new(selectedIndex, false, true);
     }
 
     private void ShowHelp()
@@ -693,7 +728,9 @@ public sealed class ConsoleGuiApp
         Console.Clear();
         Console.WriteLine("操作提示");
         Console.WriteLine("--------");
-        Console.WriteLine("- 主選單輸入 1-5 選擇功能");
+        Console.WriteLine("- 主選單使用 ↑/↓ 選擇功能");
+        Console.WriteLine("- 『單次更新時間』等同 CLI /a");
+        Console.WriteLine("- 『設定 NTP 並切換模式』等同 CLI /usentp <ntp-ip>");
         Console.WriteLine("- 輸入 h 可看提示");
         Console.WriteLine("- 設定頁可調整掃描時長、逾時與併發");
         Console.WriteLine();
@@ -739,12 +776,20 @@ public sealed class ConsoleGuiApp
                 nicItems[i + 1] = $"{nics[i].Address}  [{nics[i].Name}]";
             }
 
-            var nicIndex = SelectFromMenu(
+            var nicResult = SelectFromMenu(
                 title: "選擇掃描網卡",
                 subtitle: "=============",
                 items: nicItems,
                 keyHint: "使用 ↑/↓ 移動，Enter 確認",
-                initialSelectedIndex: 0);
+                initialSelectedIndex: _scanNicSelectedIndex);
+
+            if (nicResult.IsCanceled)
+            {
+                return;
+            }
+
+            var nicIndex = nicResult.SelectedIndex;
+            _scanNicSelectedIndex = nicIndex;
 
             if (nicIndex > 0)
             {
@@ -772,12 +817,13 @@ public sealed class ConsoleGuiApp
                 .GetResult();
 
             _pendingScanDocument = DiscoveredCameraMapper.ToCameraList(results, _settings.ConnectionTimeoutSeconds);
+            PopulateCameraModels(_pendingScanDocument).GetAwaiter().GetResult();
 
             Console.WriteLine();
             Console.WriteLine($"找到 {_pendingScanDocument.Cameras.Count} 台設備。");
             foreach (var camera in _pendingScanDocument.Cameras)
             {
-                Console.WriteLine($"- {camera.Id} {camera.Ip}:{camera.Port}");
+                Console.WriteLine($"- {FormatCameraDisplay(camera)}");
             }
 
             if (_pendingScanDocument.Cameras.Count == 0)
@@ -793,48 +839,584 @@ public sealed class ConsoleGuiApp
 
         Console.WriteLine();
         PrintKeyHint("按 Enter 返回；若找到設備，可到『保存清單』寫入 cameras.json");
-        Console.ReadLine();
+        WaitForReturnKey();
     }
 
     private void SavePendingCameraList()
     {
-        Console.Clear();
-        Console.WriteLine("保存清單");
-        Console.WriteLine("--------");
-
         if (_pendingScanDocument is null)
         {
+            Console.Clear();
+            Console.WriteLine("保存清單");
+            Console.WriteLine("--------");
             Console.WriteLine("目前沒有待保存的掃描結果。請先執行『掃描攝影機』。");
             Console.WriteLine();
+            PrintKeyHint("按 Enter 或 Esc 返回");
+            WaitForReturnKey();
+            return;
+        }
+
+        while (true)
+        {
+            var selected = PromptSelectCameras(_pendingScanDocument.Cameras);
+            if (selected is null)
+            {
+                return;
+            }
+
+            if (selected.Count == 0)
+            {
+                Console.Clear();
+                Console.WriteLine("保存清單");
+                Console.WriteLine("--------");
+                Console.WriteLine("未選擇任何設備，請重新勾選。\n");
+                PrintKeyHint("按 Enter 或 Esc 返回選擇清單");
+                WaitForReturnKey();
+                continue;
+            }
+
+            var selectedDocument = BuildSelectedCameraDocument(selected);
+
+            while (true)
+            {
+                if (!PromptCredentialWorkflow(selectedDocument.Cameras))
+                {
+                    break;
+                }
+
+                var targetPath = PromptSavePath(_paths.CamerasFilePath);
+                if (targetPath is null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    _cameraListStore.Save(
+                        targetPath,
+                        selectedDocument,
+                        new CameraListStoreOptions
+                        {
+                            EnableCredentialEncryption = _appSettings.Security.ObfuscatePasswordsWithBase64,
+                        });
+
+                    if (string.Equals(Path.GetFullPath(targetPath), Path.GetFullPath(_paths.CamerasFilePath), StringComparison.OrdinalIgnoreCase))
+                    {
+                        _cameraList = selectedDocument;
+                    }
+
+                    _pendingScanDocument = null;
+
+                    Console.Clear();
+                    Console.WriteLine("保存清單");
+                    Console.WriteLine("--------");
+                    Console.WriteLine($"已保存 {selectedDocument.Cameras.Count} 台設備到：");
+                    Console.WriteLine(targetPath);
+                    if (!string.Equals(Path.GetFullPath(targetPath), Path.GetFullPath(_paths.CamerasFilePath), StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.WriteLine();
+                        Console.WriteLine("提醒：後續 /a 與 /usentp 仍會讀取預設路徑 config/cameras.json。");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Clear();
+                    Console.WriteLine("保存清單");
+                    Console.WriteLine("--------");
+                    Console.WriteLine($"保存失敗：{ex.Message}");
+                }
+
+                Console.WriteLine();
+                PrintKeyHint("按 Enter 或 Esc 返回");
+                WaitForReturnKey();
+                return;
+            }
+        }
+    }
+
+    private List<CameraRecord>? PromptSelectCameras(IReadOnlyList<CameraRecord> cameras)
+    {
+        if (cameras.Count == 0)
+        {
+            return new List<CameraRecord>();
+        }
+
+        var selectedIndex = Math.Clamp(_saveListSelectedIndex, 0, cameras.Count - 1);
+        var selectedFlags = Enumerable.Repeat(true, cameras.Count).ToArray();
+
+        while (true)
+        {
+            Console.Clear();
+            Console.WriteLine("保存清單");
+            Console.WriteLine("--------");
+            Console.WriteLine("使用 ↑/↓ 移動，空白鍵切換 [v]/[ ]，Enter 確認，Esc 返回");
+            Console.WriteLine();
+
+            for (var i = 0; i < cameras.Count; i++)
+            {
+                var camera = cameras[i];
+                var marker = selectedFlags[i] ? "[v]" : "[ ]";
+                var prefix = i == selectedIndex ? ">" : " ";
+                Console.WriteLine($"{prefix} {marker} {FormatCameraDisplay(camera)}");
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"已選擇 {selectedFlags.Count(flag => flag)} / {cameras.Count} 台");
+
+            var key = Console.ReadKey(intercept: true);
+            switch (key.Key)
+            {
+                case ConsoleKey.UpArrow:
+                    selectedIndex = (selectedIndex - 1 + cameras.Count) % cameras.Count;
+                    break;
+                case ConsoleKey.DownArrow:
+                    selectedIndex = (selectedIndex + 1) % cameras.Count;
+                    break;
+                case ConsoleKey.Spacebar:
+                    selectedFlags[selectedIndex] = !selectedFlags[selectedIndex];
+                    break;
+                case ConsoleKey.Enter:
+                    _saveListSelectedIndex = selectedIndex;
+                    return cameras
+                        .Where((_, index) => selectedFlags[index])
+                        .ToList();
+                case ConsoleKey.Escape:
+                    _saveListSelectedIndex = selectedIndex;
+                    return null;
+            }
+        }
+    }
+
+    private CameraListDocument BuildSelectedCameraDocument(IReadOnlyList<CameraRecord> selected)
+    {
+        var selectedDocument = CameraListDocument.CreateEmpty();
+
+        foreach (var camera in selected)
+        {
+            var existing = _cameraList.Cameras.FirstOrDefault(item =>
+                item.EndpointKey.Equals(camera.EndpointKey, StringComparison.OrdinalIgnoreCase));
+
+            selectedDocument.Cameras.Add(new CameraRecord
+            {
+                Id = camera.Id,
+                Ip = camera.Ip,
+                Port = camera.Port,
+                Model = string.IsNullOrWhiteSpace(camera.Model) ? existing?.Model ?? string.Empty : camera.Model,
+                Username = existing?.Username ?? camera.Username,
+                Password = existing?.Password ?? camera.Password,
+                PasswordEncrypted = string.Empty,
+                Enabled = existing?.Enabled ?? true,
+                ConnectionTimeoutSeconds = existing?.ConnectionTimeoutSeconds ?? _settings.ConnectionTimeoutSeconds,
+                NtpServerIp = existing?.NtpServerIp ?? camera.NtpServerIp,
+            });
+        }
+
+        return selectedDocument;
+    }
+
+    private bool PromptCredentialWorkflow(IReadOnlyList<CameraRecord> cameras)
+    {
+        var items = new[]
+        {
+            "一次套用同一組帳密到全部已選設備",
+            "逐台覆寫帳密",
+            "完成並進入保存路徑",
+        };
+
+        while (true)
+        {
+            var result = SelectFromMenu(
+                title: "帳密設定",
+                subtitle: "========",
+                items: items,
+                keyHint: "使用 ↑/↓ 移動，Enter 確認，Esc 返回上一層",
+                initialSelectedIndex: _credentialMenuSelectedIndex);
+
+            _credentialMenuSelectedIndex = result.SelectedIndex;
+
+            if (result.IsCanceled)
+            {
+                return false;
+            }
+
+            switch (result.SelectedIndex)
+            {
+                case 0:
+                    PromptBulkCredentials(cameras);
+                    break;
+                case 1:
+                    PromptPerCameraCredentials(cameras);
+                    break;
+                case 2:
+                    return true;
+            }
+        }
+    }
+
+    private void PromptBulkCredentials(IReadOnlyList<CameraRecord> cameras)
+    {
+        Console.Clear();
+        Console.WriteLine("批次套用帳密");
+        Console.WriteLine("------------");
+        Console.WriteLine($"將套用到 {cameras.Count} 台已選設備。直接 Enter = 保留原值，輸入 ! = 清空，Esc = 返回。\n");
+
+        Console.Write("帳號: ");
+        var usernameInput = ReadInteractiveInput();
+        if (usernameInput.IsCanceled)
+        {
+            return;
+        }
+
+        Console.Write("密碼: ");
+        var passwordInput = ReadInteractiveInput(maskInput: true);
+        if (passwordInput.IsCanceled)
+        {
+            return;
+        }
+
+        foreach (var camera in cameras)
+        {
+            camera.Username = ApplyCredentialInput(camera.Username, usernameInput.Value);
+            camera.Password = ApplyCredentialInput(camera.Password, passwordInput.Value);
+        }
+
+        Console.WriteLine();
+        PrintKeyHint("已套用完成，按 Enter 或 Esc 返回帳密選單");
+        WaitForReturnKey();
+    }
+
+    private void PromptPerCameraCredentials(IReadOnlyList<CameraRecord> cameras)
+    {
+        while (true)
+        {
+            var items = cameras
+                .Select(camera => $"{FormatCameraDisplay(camera)} | user={FormatCredentialValue(camera.Username)} | pass={FormatPasswordValue(camera.Password)}")
+                .ToArray();
+
+            var result = SelectFromMenu(
+                title: "逐台覆寫帳密",
+                subtitle: "============",
+                items: items,
+                keyHint: "使用 ↑/↓ 移動，Enter 編輯，Esc 返回帳密選單",
+                initialSelectedIndex: _credentialCameraSelectedIndex);
+
+            _credentialCameraSelectedIndex = result.SelectedIndex;
+
+            if (result.IsCanceled)
+            {
+                return;
+            }
+
+            EditSingleCameraCredential(cameras[result.SelectedIndex]);
+        }
+    }
+
+    private void EditSingleCameraCredential(CameraRecord camera)
+    {
+        Console.Clear();
+        Console.WriteLine("逐台覆寫帳密");
+        Console.WriteLine("============");
+        Console.WriteLine(FormatCameraDisplay(camera));
+        Console.WriteLine("直接 Enter = 保留原值，輸入 ! = 清空，Esc = 返回上一層。\n");
+
+        var nextUsername = camera.Username;
+        var nextPassword = camera.Password;
+
+        Console.Write($"帳號 [{FormatCredentialValue(camera.Username)}]: ");
+        var usernameInput = ReadInteractiveInput();
+        if (usernameInput.IsCanceled)
+        {
+            return;
+        }
+
+        nextUsername = ApplyCredentialInput(nextUsername, usernameInput.Value);
+
+        Console.Write($"密碼 [{FormatPasswordValue(camera.Password)}]: ");
+        var passwordInput = ReadInteractiveInput(maskInput: true);
+        if (passwordInput.IsCanceled)
+        {
+            return;
+        }
+
+        nextPassword = ApplyCredentialInput(nextPassword, passwordInput.Value);
+
+        camera.Username = nextUsername;
+        camera.Password = nextPassword;
+    }
+
+    private static string ApplyCredentialInput(string currentValue, string input)
+    {
+        if (input.Equals("!", StringComparison.Ordinal))
+        {
+            return string.Empty;
+        }
+
+        if (!string.IsNullOrEmpty(input))
+        {
+            return input;
+        }
+
+        return currentValue;
+    }
+
+    private static string FormatCredentialValue(string value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "(空)" : value;
+    }
+
+    private static string FormatPasswordValue(string value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "(空)" : "******";
+    }
+
+    private static InteractiveInputResult ReadInteractiveInput(bool maskInput = false)
+    {
+        var buffer = new StringBuilder();
+
+        while (true)
+        {
+            var key = Console.ReadKey(intercept: true);
+            switch (key.Key)
+            {
+                case ConsoleKey.Enter:
+                    Console.WriteLine();
+                    return InteractiveInputResult.Confirm(buffer.ToString());
+                case ConsoleKey.Escape:
+                    Console.WriteLine();
+                    return InteractiveInputResult.Cancel();
+                case ConsoleKey.Backspace:
+                    if (buffer.Length > 0)
+                    {
+                        buffer.Length--;
+                        Console.Write("\b \b");
+                    }
+                    break;
+                default:
+                    if (!char.IsControl(key.KeyChar))
+                    {
+                        buffer.Append(key.KeyChar);
+                        Console.Write(maskInput ? '*' : key.KeyChar);
+                    }
+                    break;
+            }
+        }
+    }
+
+    private static string? PromptSavePath(string defaultPath)
+    {
+        Console.Clear();
+        Console.WriteLine("保存路徑");
+        Console.WriteLine("--------");
+        Console.WriteLine($"預設保存路徑：{defaultPath}");
+        Console.WriteLine("直接 Enter 使用預設，Esc 返回帳密選單。\n");
+        Console.Write("請輸入保存路徑: ");
+        var inputResult = ReadInteractiveInput();
+        if (inputResult.IsCanceled)
+        {
+            return null;
+        }
+
+        var input = inputResult.Value;
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return defaultPath;
+        }
+
+        var candidate = input.Trim();
+        if (!Path.IsPathRooted(candidate))
+        {
+            candidate = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, candidate));
+        }
+
+        return candidate;
+    }
+
+    private async Task PopulateCameraModels(CameraListDocument document)
+    {
+        var candidates = document.Cameras
+            .Where(camera => string.IsNullOrWhiteSpace(camera.Model))
+            .ToList();
+
+        if (candidates.Count == 0)
+        {
+            return;
+        }
+
+        using var semaphore = new SemaphoreSlim(Math.Max(1, _settings.MaxConcurrency));
+        var tasks = candidates.Select(async camera =>
+        {
+            await semaphore.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                var model = await TryResolveCameraModelAsync(camera).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(model))
+                {
+                    camera.Model = model;
+                }
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        });
+
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+    }
+
+    private async Task<string> TryResolveCameraModelAsync(CameraRecord camera)
+    {
+        var existing = _cameraList.Cameras.FirstOrDefault(item =>
+            item.EndpointKey.Equals(camera.EndpointKey, StringComparison.OrdinalIgnoreCase));
+
+        if (!string.IsNullOrWhiteSpace(existing?.Model))
+        {
+            return existing.Model;
+        }
+
+        var probeCamera = new CameraRecord
+        {
+            Id = camera.Id,
+            Ip = camera.Ip,
+            Port = camera.Port,
+            Username = existing?.Username ?? string.Empty,
+            Password = existing?.Password ?? string.Empty,
+            ConnectionTimeoutSeconds = camera.ConnectionTimeoutSeconds,
+        };
+
+        var info = await _deviceManagementService.GetDeviceInformationAsync(
+            probeCamera,
+            Math.Max(1, camera.ConnectionTimeoutSeconds),
+            CancellationToken.None).ConfigureAwait(false);
+
+        return info.Success ? info.Model : string.Empty;
+    }
+
+    private static string FormatCameraDisplay(CameraRecord camera)
+    {
+        var model = string.IsNullOrWhiteSpace(camera.Model) ? "Unknown" : camera.Model;
+        return $"{camera.Id} {camera.Ip}:{camera.Port} [{model}]";
+    }
+
+    private readonly record struct InteractiveInputResult(string Value, bool IsCanceled)
+    {
+        public static InteractiveInputResult Confirm(string value) => new(value, false);
+
+        public static InteractiveInputResult Cancel() => new(string.Empty, true);
+    }
+
+    private void ShowUpdateOnceWorkflow()
+    {
+        Console.Clear();
+        Console.WriteLine("單次更新時間");
+        Console.WriteLine("----------");
+        Console.WriteLine("將對 cameras.json 內所有啟用且有帳密的攝影機執行一次手動時間更新。");
+        Console.WriteLine();
+        if (!AskYesNo("是否開始執行？(y/N)", defaultYes: false))
+        {
+            return;
+        }
+
+        ExecuteAndShowOperateCommand(new[] { "/a" }, "單次更新完成。", shouldReloadCameraList: false);
+    }
+
+    private void ShowUseNtpWorkflow()
+    {
+        Console.Clear();
+        Console.WriteLine("設定 NTP 並切換模式");
+        Console.WriteLine("------------------");
+        Console.WriteLine("將對 cameras.json 內所有啟用且有帳密的攝影機設定 NTP，並切換 DateTimeType 到 NTP。");
+        Console.WriteLine();
+
+        var suggested = _cameraList.Cameras.FirstOrDefault(camera => !string.IsNullOrWhiteSpace(camera.NtpServerIp))?.NtpServerIp;
+        if (!string.IsNullOrWhiteSpace(suggested))
+        {
+            Console.WriteLine($"建議 NTP IP（來自現有清單）：{suggested}");
+        }
+
+        Console.Write("請輸入 NTP Server IP");
+        if (!string.IsNullOrWhiteSpace(suggested))
+        {
+            Console.Write($"（直接 Enter 使用 {suggested}）");
+        }
+
+        Console.Write(": ");
+        var input = ReadTrimmed();
+        var ntpIp = string.IsNullOrWhiteSpace(input) ? suggested ?? string.Empty : input;
+        if (!IPAddress.TryParse(ntpIp, out _))
+        {
+            Console.WriteLine();
+            Console.WriteLine($"輸入格式錯誤：{ntpIp}");
             PrintKeyHint("按 Enter 返回");
             Console.ReadLine();
             return;
         }
 
+        if (!AskYesNo($"確認對啟用設備下發 NTP={ntpIp}？(y/N)", defaultYes: false))
+        {
+            return;
+        }
+
+        ExecuteAndShowOperateCommand(new[] { "/usentp", ntpIp }, "NTP 設定完成。", shouldReloadCameraList: true);
+    }
+
+    private void ExecuteAndShowOperateCommand(string[] args, string successTitle, bool shouldReloadCameraList)
+    {
+        Console.Clear();
+        Console.WriteLine(successTitle);
+        Console.WriteLine(new string('-', successTitle.Length));
+
+        var parsed = CliCommandParser.Parse(args);
+        var result = _cliDispatcher.Execute(parsed);
+
+        Console.WriteLine(result.Message);
+
+        if (shouldReloadCameraList)
+        {
+            TryReloadCameraList();
+        }
+
+        Console.WriteLine();
+        if (result.ExitCode == 0)
+        {
+            PrintKeyHint("按 Enter 返回");
+        }
+        else
+        {
+            PrintKeyHint("執行中有錯誤，請檢查訊息後按 Enter 返回");
+        }
+
+        Console.ReadLine();
+    }
+
+    private void TryReloadCameraList()
+    {
         try
         {
-            _cameraListStore.Save(
+            _appSettings = _settingsStore.Load(_paths.SettingsFilePath);
+            _cameraList = _cameraListStore.Load(
                 _paths.CamerasFilePath,
-                _pendingScanDocument,
                 new CameraListStoreOptions
                 {
                     EnableCredentialEncryption = _appSettings.Security.ObfuscatePasswordsWithBase64,
                 });
-
-            _cameraList = _pendingScanDocument;
-            _pendingScanDocument = null;
-
-            Console.WriteLine($"已保存 {_cameraList.Cameras.Count} 台設備到：");
-            Console.WriteLine(_paths.CamerasFilePath);
         }
-        catch (Exception ex)
+        catch
         {
-            Console.WriteLine($"保存失敗：{ex.Message}");
+            // Ignore reload failures: result details are already shown by dispatcher.
+        }
+    }
+
+    private static bool AskYesNo(string prompt, bool defaultYes)
+    {
+        Console.WriteLine(prompt);
+        PrintKeyHint(defaultYes ? "輸入 y 或 n，直接 Enter 視為 y" : "輸入 y 或 n，直接 Enter 視為 n");
+        var input = ReadTrimmed();
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return defaultYes;
         }
 
-        Console.WriteLine();
-        PrintKeyHint("按 Enter 返回");
-        Console.ReadLine();
+        return input.Equals("y", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void ApplyAppSettingsToGuiState(AppSettings appSettings, ConsoleGuiSettings guiSettings)
@@ -873,5 +1455,17 @@ public sealed class ConsoleGuiApp
     private static void PrintKeyHint(string hint)
     {
         Console.WriteLine($"[鍵盤提示] {hint}");
+    }
+
+    private static void WaitForReturnKey()
+    {
+        while (true)
+        {
+            var key = Console.ReadKey(intercept: true);
+            if (key.Key is ConsoleKey.Enter or ConsoleKey.Escape)
+            {
+                return;
+            }
+        }
     }
 }

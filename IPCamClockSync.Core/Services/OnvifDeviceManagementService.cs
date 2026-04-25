@@ -2,12 +2,53 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Text;
+using System.Xml.Linq;
 using IPCamClockSync.Core.Data;
 
 namespace IPCamClockSync.Core.Services;
 
 public sealed class OnvifDeviceManagementService : IOnvifDeviceManagementService
 {
+    public async Task<OnvifDeviceInformationResult> GetDeviceInformationAsync(
+        CameraRecord camera,
+        int timeoutSeconds,
+        CancellationToken cancellationToken)
+    {
+        var endpoint = BuildDeviceEndpoint(camera);
+        var body = "<tds:GetDeviceInformation xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" />";
+
+        try
+        {
+            var payload = await SendDeviceRequestForPayloadAsync(camera, endpoint, body, timeoutSeconds, cancellationToken).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(payload))
+            {
+                return OnvifDeviceInformationResult.Fail("protocol", "Device returned an empty payload.");
+            }
+
+            var document = XDocument.Parse(payload);
+            var model = FindDescendantValue(document.Root, "Model");
+            var manufacturer = FindDescendantValue(document.Root, "Manufacturer");
+            var firmwareVersion = FindDescendantValue(document.Root, "FirmwareVersion");
+            return OnvifDeviceInformationResult.Ok(model, manufacturer, firmwareVersion);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return OnvifDeviceInformationResult.Fail("timeout", "ONVIF request timed out.");
+        }
+        catch (HttpRequestException ex) when (ex.InnerException is SocketException)
+        {
+            return OnvifDeviceInformationResult.Fail("network", ex.Message);
+        }
+        catch (HttpRequestException ex)
+        {
+            return OnvifDeviceInformationResult.Fail("network", ex.Message);
+        }
+        catch (Exception ex)
+        {
+            return OnvifDeviceInformationResult.Fail("unknown", ex.Message);
+        }
+    }
+
     public async Task<OnvifOperationResult> SetSystemDateAndTimeAsync(
         CameraRecord camera,
         DateTimeOffset localNow,
@@ -67,37 +108,10 @@ public sealed class OnvifDeviceManagementService : IOnvifDeviceManagementService
         int timeoutSeconds,
         CancellationToken cancellationToken)
     {
-        var endpoint = BuildDeviceEndpoint(camera);
-
         try
         {
-            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Max(1, timeoutSeconds)));
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken);
-            using var httpClient = new HttpClient();
-            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
-            {
-                Content = new StringContent(BuildSoapEnvelope(body), Encoding.UTF8, "application/soap+xml"),
-            };
-
-            if (!string.IsNullOrWhiteSpace(camera.Username) || !string.IsNullOrWhiteSpace(camera.Password))
-            {
-                var token = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{camera.Username}:{camera.Password}"));
-                request.Headers.Authorization = new AuthenticationHeaderValue("Basic", token);
-            }
-
-            using var response = await httpClient.SendAsync(request, linkedCts.Token).ConfigureAwait(false);
-            var payload = await response.Content.ReadAsStringAsync(linkedCts.Token).ConfigureAwait(false);
-
-            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-            {
-                return OnvifOperationResult.Fail("auth", $"Device rejected credentials. HTTP {(int)response.StatusCode}.");
-            }
-
-            if (!response.IsSuccessStatusCode)
-            {
-                return OnvifOperationResult.Fail("protocol", $"Device returned HTTP {(int)response.StatusCode}.");
-            }
-
+            var endpoint = BuildDeviceEndpoint(camera);
+            var payload = await SendDeviceRequestForPayloadAsync(camera, endpoint, body, timeoutSeconds, cancellationToken).ConfigureAwait(false);
             if (payload.Contains("<Fault", StringComparison.OrdinalIgnoreCase))
             {
                 return OnvifOperationResult.Fail("protocol", "ONVIF SOAP fault returned by device.");
@@ -128,6 +142,43 @@ public sealed class OnvifDeviceManagementService : IOnvifDeviceManagementService
         return $"http://{camera.Ip}:{camera.Port}/onvif/device_service";
     }
 
+    private static async Task<string> SendDeviceRequestForPayloadAsync(
+        CameraRecord camera,
+        string endpoint,
+        string body,
+        int timeoutSeconds,
+        CancellationToken cancellationToken)
+    {
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Max(1, timeoutSeconds)));
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken);
+        using var httpClient = new HttpClient();
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+        {
+            Content = new StringContent(BuildSoapEnvelope(body), Encoding.UTF8, "application/soap+xml"),
+        };
+
+        if (!string.IsNullOrWhiteSpace(camera.Username) || !string.IsNullOrWhiteSpace(camera.Password))
+        {
+            var token = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{camera.Username}:{camera.Password}"));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", token);
+        }
+
+        using var response = await httpClient.SendAsync(request, linkedCts.Token).ConfigureAwait(false);
+        var payload = await response.Content.ReadAsStringAsync(linkedCts.Token).ConfigureAwait(false);
+
+        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            throw new HttpRequestException($"Device rejected credentials. HTTP {(int)response.StatusCode}.");
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"Device returned HTTP {(int)response.StatusCode}.");
+        }
+
+        return payload;
+    }
+
     private static string BuildSoapEnvelope(string body)
     {
         return
@@ -146,5 +197,14 @@ public sealed class OnvifDeviceManagementService : IOnvifDeviceManagementService
         var posixSign = offset >= TimeSpan.Zero ? '-' : '+';
         var absolute = offset.Duration();
         return $"CST{posixSign}{absolute.Hours}:{absolute.Minutes:00}:00";
+    }
+
+    private static string FindDescendantValue(XElement? root, string localName)
+    {
+        return root?
+            .Descendants()
+            .FirstOrDefault(element => string.Equals(element.Name.LocalName, localName, StringComparison.OrdinalIgnoreCase))
+            ?.Value
+            ?.Trim() ?? string.Empty;
     }
 }

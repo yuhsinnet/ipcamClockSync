@@ -90,8 +90,8 @@ dotnet run --project IPCamClockSync -- /h
 - Phase 0：✅ 完成（規格定版、solution/分層、設定/清單格式、防火牆模式）
 - Phase 1：✅ 完成（掃描/相容性、持久化、設定管理、Base64 帳密）
 - Phase 2：✅ 完成（手動時間更新與 NTP 模式切換分流、實機驗證完成）
-- Phase 3：🟡 部分完成（最小 NTP Server 可運作；Service/安裝/防火牆生命週期待補）
-- Phase 4：🚧 進行中（GUI 流程與 UX 持續完善）
+- Phase 3：✅ 完成（最小 NTP Server、Service 控制、安裝/移除、防火牆生命週期、CLI 驗證已可用）
+- Phase 4：🚧 進行中（GUI 已接入 /a 與 /usentp，設定頁與服務控制頁持續完善）
 - Phase 5：🚧 進行中（CLI 指令樹、靜默輸出規格與錯誤碼表待完善）
 - Phase 6：⬜ 待開始（日誌輪替、部署、穩定性/壓力測試、correlationId 全流程追蹤）
 

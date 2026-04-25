@@ -31,6 +31,7 @@ public sealed class CameraListStoreTests
                     Id = "cam-001",
                     Ip = "192.168.1.10",
                     Port = 8080,
+                    Model = "IPC-Model-01",
                     Username = "admin",
                     Password = "pass",
                     Enabled = true,
@@ -46,6 +47,7 @@ public sealed class CameraListStoreTests
         Assert.Equal("cam-001", loaded.Cameras[0].Id);
         Assert.Equal("192.168.1.10", loaded.Cameras[0].Ip);
         Assert.Equal(8080, loaded.Cameras[0].Port);
+        Assert.Equal("IPC-Model-01", loaded.Cameras[0].Model);
         Assert.Equal(25, loaded.Cameras[0].ConnectionTimeoutSeconds);
     }
 

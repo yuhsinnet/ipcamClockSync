@@ -165,6 +165,7 @@ public sealed class CameraListStore
                 Enabled = camera.Enabled,
                 ConnectionTimeoutSeconds = camera.ConnectionTimeoutSeconds,
                 NtpServerIp = camera.NtpServerIp,
+                Model = camera.Model,
             }).ToList(),
         };
     }

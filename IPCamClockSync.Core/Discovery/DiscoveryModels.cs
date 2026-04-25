@@ -33,4 +33,6 @@ public sealed class DiscoveredCamera
     public string ServiceAddress { get; init; } = string.Empty;
 
     public IReadOnlyList<string> Scopes { get; init; } = Array.Empty<string>();
+
+    public string Model { get; init; } = string.Empty;
 }

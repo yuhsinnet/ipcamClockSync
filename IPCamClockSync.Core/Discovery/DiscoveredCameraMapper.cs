@@ -19,6 +19,7 @@ public static class DiscoveredCameraMapper
                 Id = $"cam-{index:000}",
                 Ip = uri?.Host ?? camera.Address,
                 Port = uri?.Port > 0 ? uri.Port : 80,
+                Model = camera.Model,
                 Username = string.Empty,
                 Password = string.Empty,
                 Enabled = true,
