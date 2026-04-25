@@ -56,5 +56,12 @@ public sealed class NtpWindowsServiceController
         return Start();
     }
 
+    public CommandRunResult VerifyViaStripChart(string computer, int samples)
+    {
+        var normalizedComputer = string.IsNullOrWhiteSpace(computer) ? "127.0.0.1" : computer.Trim();
+        var normalizedSamples = Math.Clamp(samples, 1, 20);
+        return _runner.Run("w32tm.exe", $"/stripchart /computer:{normalizedComputer} /samples:{normalizedSamples}");
+    }
+
     public CommandRunResult Status() => _runner.Run("sc.exe", $"query \"{DefaultServiceName}\"");
 }

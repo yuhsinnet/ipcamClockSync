@@ -88,6 +88,22 @@ public class NtpWindowsServiceControllerTests
         Assert.Single(runner.Calls);
     }
 
+    [Fact]
+    public void VerifyViaStripChart_ShouldRunW32tmWithExpectedArguments()
+    {
+        var runner = new RecordingCommandRunner(new CommandRunResult { ExitCode = 0, Output = "stripchart ok" });
+        var sut = new NtpWindowsServiceController(runner);
+
+        var result = sut.VerifyViaStripChart("127.0.0.1", 3);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Single(runner.Calls);
+        Assert.Equal("w32tm.exe", runner.Calls[0].FileName);
+        Assert.Contains("/stripchart", runner.Calls[0].Arguments, StringComparison.Ordinal);
+        Assert.Contains("/computer:127.0.0.1", runner.Calls[0].Arguments, StringComparison.Ordinal);
+        Assert.Contains("/samples:3", runner.Calls[0].Arguments, StringComparison.Ordinal);
+    }
+
     private sealed class RecordingCommandRunner : ICommandRunner
     {
         private readonly Queue<CommandRunResult> _results;
