@@ -74,8 +74,9 @@ dotnet run --project IPCamClockSync -- /h
 
 - `/h`：Help（含指令分群）
 - `/scan`：掃描 ONVIF 設備並輸出清單（`cameras.json`）
-- `/set-ntp`：對清單套用目標 NTP IP（目前「清單寫入」已可用；實際推送到設備進行中）
-- `/a`：批次更新流程入口（更新前檢查/重試/錯誤分類已建立；完整 ONVIF 時間推送進行中）
+- `/a`：手動單次時間更新（Manual）
+- `/usentp <ntp-ip>`：設定 NTP 伺服器並切換時間來源到 NTP
+- `/set-ntp <ntp-ip>`：相容別名，等同 `/usentp <ntp-ip>`
 - 防火牆：`status|enable|disable|repair`（已可用）
 - 服務管理：`install|uninstall|status`（已可用）
 - NTP Server：`/ntpserver start|stop|restart|status`（依實作進度）
@@ -88,7 +89,7 @@ dotnet run --project IPCamClockSync -- /h
 
 - Phase 0：✅ 完成（規格定版、solution/分層、設定/清單格式、防火牆模式）
 - Phase 1：✅ 完成（掃描/相容性、持久化、設定管理、Base64 帳密）
-- Phase 2：🚧 進行中（ONVIF 時間同步 / NTP 設定推送 / 併發引擎）
+- Phase 2：✅ 完成（手動時間更新與 NTP 模式切換分流、實機驗證完成）
 - Phase 3：🟡 部分完成（最小 NTP Server 可運作；Service/安裝/防火牆生命週期待補）
 - Phase 4：🚧 進行中（GUI 流程與 UX 持續完善）
 - Phase 5：🚧 進行中（CLI 指令樹、靜默輸出規格與錯誤碼表待完善）

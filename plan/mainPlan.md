@@ -20,15 +20,16 @@
    2.3 設定管理：YAML 載入/儲存、預設值、遺漏欄位回填。
    2.4 帳密儲存：改為 Base64 混淆（非明碼），含回退策略與錯誤處理。
 
-3. Phase 2 - 時間同步能力（進行中）
+3. Phase 2 - 時間同步能力（已完成）
    3.1 單次時間更新：每台更新前重讀系統時間，推送本機時區與時間。
-      - 現況：/a 已有更新前檢查流程（含重試與錯誤分類），尚待接上完整 ONVIF 時間推送。
-   3.2 NTP 設定推送：對清單攝影機批次套用目標 NTP IP。
-      - 現況：/set-ntp 已可批次寫入清單；尚待實際推送到設備。
+      - 現況：/a 已改為實際 ONVIF SetSystemDateAndTime，含重試與錯誤分類。
+      - 已修正時區格式為相容多數 IPCAM 的 POSIX 風格（例如 CST-8:00:00），現場驗證顯示正確。
+   3.2 NTP 設定推送：對清單攝影機批次套用目標 NTP IP，並切換時間來源到 NTP。
+      - 現況：/usentp 已改為實際 ONVIF SetNTP + DateTimeType=NTP，下發成功才寫回 cameras.json。
    3.3 連線控制：逾時、重試、失敗分類（授權、網路、協議）。
-      - 現況：已落地 auth/timeout/network/unknown 分類基礎。
+      - 現況：已落地 auth/timeout/network/protocol/unknown 分類與重試策略。
    3.4 並行更新能力：單執行緒/多執行緒切換與最大併發數。
-      - 現況：設定欄位已存在，執行引擎尚待完成。
+      - 現況：已接入批次執行引擎，依 MaxConcurrency 控制並行度。
 
 4. Phase 3 - NTP Server 與服務控制（部分完成，可與 Phase 2 平行）
    4.1 實作獨立 NTP Server 執行檔（UDP 123、狀態日誌、監控欄位）。
@@ -52,7 +53,7 @@
 
 6. Phase 5 - CLI 完整化（進行中）
    6.1 既有命令：/a、/ntpserver start|stop|restart。
-   6.2 新增命令：/scan、/set-ntp、/validate、/export、/h（已可用）。
+   6.2 新增命令：/scan、/usentp（/set-ntp alias）、/validate、/export、/h（已可用）。
    6.3 靜默模式輸出規範：成功/失敗碼、摘要列、錯誤碼表（部分完成）。
    6.4 防火牆命令：status|enable|disable|repair（已可用）。
    6.5 服務管理命令：install|uninstall|status（已可用）。
@@ -66,7 +67,7 @@
 
 ## Verification
 1. 單元測試：設定載入/回填、清單序列化、命令解析、Base64 帳密處理。
-2. CLI 實機驗證：/scan 可掃描並輸出 cameras.json；/set-ntp 與 /a 可執行。
+2. CLI 實機驗證：/scan 可掃描並輸出 cameras.json；/a（手動）與 /usentp（NTP）可執行。
 3. GUI 驗證：主流程可操作，網卡綁定選單可用。
 4. 服務驗證：/ntpserver service 與 firewall 子命令可操作。
 
@@ -82,18 +83,19 @@
 - feat: 完成 Phase 1 並改為 Base64 密碼儲存
 - feat: 推進 Phase 2 並補齊 update/set-ntp 流程
 - 修復 WS-Discovery 掃描相容性並新增網卡綁定選單
+- 修正 ONVIF 時區送值格式並完成實機驗證（/a、/set-ntp）
 
 ## Current Status
 - Phase 0: 完成
 - Phase 1: 完成（含 WS-Discovery 相容性修復）
-- Phase 2: 進行中（已完成基礎連線控制與命令接線）
+- Phase 2: 完成（ONVIF 時間同步/NTP 推送/重試分類/並行）
 - Phase 3: 部分完成（最小 NTP server + service/firewall 控制已具備）
 - Phase 4: 進行中（GUI 基礎功能與 UX 已有可用版本）
 - Phase 5: 進行中（核心命令可用，待完善錯誤碼與輸出規範）
 - Phase 6: 待開始
 
 ## Next Targets
-1. 完成真正 ONVIF 時間推送（對應 Phase 2.1）。
-2. 完成真正 NTP 設定下發到設備（對應 Phase 2.2）。
-3. 補齊併發更新引擎與回報彙整（對應 Phase 2.4）。
-4. 補齊 CLI 靜默輸出規格與錯誤碼表（對應 Phase 5.3）。
+1. 將 /a、/set-ntp 流程完整接入 Console GUI（對應 Phase 4.4）。
+2. 補齊 CLI 靜默輸出規格與錯誤碼表（對應 Phase 5.3）。
+3. 補齊 config/diagnose 指令群（對應 Phase 5.6）。
+4. 進入 Phase 3/6 的服務化與部署穩定化驗證。

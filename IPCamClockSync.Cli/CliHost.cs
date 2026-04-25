@@ -24,6 +24,7 @@ public static class CliHost
             new YamlSettingsStore(),
             new CameraListStore(),
             new OnvifWsDiscoveryService(),
+            new OnvifDeviceManagementService(),
             serviceController,
             firewallController);
 

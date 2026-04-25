@@ -27,7 +27,8 @@ public static class CliCommandParser
         {
             "/scan" => Build(CommandGroup.Operate, "scan", normalized[1..]),
             "/a" => Build(CommandGroup.Operate, "update-once", normalized[1..]),
-            "/set-ntp" => Build(CommandGroup.Operate, "set-ntp", normalized[1..]),
+            "/usentp" => Build(CommandGroup.Operate, "use-ntp", normalized[1..]),
+            "/set-ntp" => Build(CommandGroup.Operate, "use-ntp", normalized[1..]),
             "/validate" => Build(CommandGroup.Operate, "validate", normalized[1..]),
             "/export" => Build(CommandGroup.Operate, "export", normalized[1..]),
             "/ntpserver" => ParseNtpServer(normalized),
@@ -84,6 +85,20 @@ public static class CliCommandParser
             }
 
             return Build(CommandGroup.Service, "service", args[3..], args[2].ToLowerInvariant());
+        }
+
+        if (second == "cli")
+        {
+            if (args.Length < 3)
+            {
+                return Invalid("/ntpserver cli requires action: verify [computer] [samples]");
+            }
+
+            return args[2].ToLowerInvariant() switch
+            {
+                "verify" => Build(CommandGroup.Service, "service", args[3..], "cli-verify"),
+                _ => Invalid($"Unsupported /ntpserver cli action: {args[2]}"),
+            };
         }
 
         return second switch
